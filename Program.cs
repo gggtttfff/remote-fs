@@ -14,6 +14,16 @@ public static class Program
 {
     public static async Task<int> Main(string[] args)
     {
+        // 控制台文本输出统一用 UTF-8，避免 Windows 默认代码页导致中文乱码
+        try
+        {
+            Console.OutputEncoding = new System.Text.UTF8Encoding(false);
+        }
+        catch (Exception)
+        {
+            // 输出被重定向等场景下设置可能失败，不影响主流程
+        }
+
         try
         {
             if (args.Length == 0)
