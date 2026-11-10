@@ -16,7 +16,7 @@
 
 ## 安装
 
-从 [Releases](https://github.com/你的用户名/remote-fs/releases) 下载对应平台的压缩包，解压后把 `remote-fs`（Windows 为 `remote-fs.exe`）放进 `PATH`。
+从 [Releases](https://github.com/gggtttfff/remote-fs/releases) 下载对应平台的压缩包，解压后把 `remote-fs`（Windows 为 `remote-fs.exe`）放进 `PATH`。
 
 ## 快速开始
 
@@ -153,7 +153,7 @@ remote-fs hosts fingerprint web1
 ## 从源码构建
 
 ```bash
-git clone https://github.com/你的用户名/remote-fs.git
+git clone https://github.com/gggtttfff/remote-fs.git
 cd remote-fs
 dotnet publish -c Release -r win-x64 --self-contained true -o ./out
 ```

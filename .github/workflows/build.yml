@@ -74,21 +74,17 @@ jobs:
           -p:DebugType=none
           -o ./out
 
+      # 统一用 pwsh 的 Compress-Archive，Windows runner 上没有 zip 命令
       - name: 打包为压缩包
-        shell: bash
+        shell: pwsh
         run: |
-          cd out
-          zip -r ../${{ matrix.artifact }}.zip .
-          cd ..
-          tar -czf ${{ matrix.artifact }}.tar.gz -C out .
+          Compress-Archive -Path ./out/* -DestinationPath "${{ matrix.artifact }}.zip" -Force
 
       - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: |
-            ${{ matrix.artifact }}.zip
-            ${{ matrix.artifact }}.tar.gz
+          path: ${{ matrix.artifact }}.zip
 
   release:
     name: 创建发布版本
