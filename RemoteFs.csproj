@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>RemoteFs</AssemblyName>
+    <RootNamespace>RemoteFs</RootNamespace>
+    <Version>1.0.0</Version>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <!-- 发布为单文件自包含 exe，部署时无需安装 .NET 运行时 -->
+  <PropertyGroup>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <DebugType>none</DebugType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- SSH.NET：纯托管 SSH/SFTP 实现，不依赖系统 OpenSSH 客户端。
+         固定 2024.2.0：2025/2026 版本的连接与会话 API 有破坏性变更。
+         已知告警中 GHSA-q939-rpr3-3284 与 GHSA-mggc-4xg6-vcxf 仅影响 ScpClient，
+         本项目只用 SftpClient，不受影响，故在 NuGetAudit 中排除。 -->
+    <PackageReference Include="SSH.NET" Version="2024.2.0" NoWarn="NU1903" />
+  </ItemGroup>
+
+</Project>

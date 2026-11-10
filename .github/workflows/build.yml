@@ -1,0 +1,132 @@
+name: 构建与发布
+
+on:
+  push:
+    tags:
+      - "v*"
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+
+jobs:
+  build:
+    name: 构建 ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            rid: win-x64
+            artifact: remote-fs-windows-x64
+          - os: windows-latest
+            rid: win-arm64
+            artifact: remote-fs-windows-arm64
+          - os: ubuntu-latest
+            rid: linux-x64
+            artifact: remote-fs-linux-x64
+          - os: ubuntu-latest
+            rid: linux-arm64
+            artifact: remote-fs-linux-arm64
+          - os: macos-latest
+            rid: osx-x64
+            artifact: remote-fs-macos-x64
+          - os: macos-latest
+            rid: osx-arm64
+            artifact: remote-fs-macos-arm64
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 .NET 9 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: 还原依赖
+        run: dotnet restore RemoteFs.csproj
+
+      - name: 编译
+        run: dotnet build RemoteFs.csproj -c Release --no-restore
+
+      - name: 发布单文件
+        run: >
+          dotnet publish RemoteFs.csproj
+          -c Release
+          -r ${{ matrix.rid }}
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:EnableCompressionInSingleFile=true
+          -p:DebugType=none
+          -o ./out
+
+      - name: 打包为压缩包
+        shell: bash
+        run: |
+          cd out
+          zip -r ../${{ matrix.artifact }}.zip .
+          cd ..
+          tar -czf ${{ matrix.artifact }}.tar.gz -C out .
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.zip
+            ${{ matrix.artifact }}.tar.gz
+
+  release:
+    name: 创建发布版本
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 下载全部产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: 创建 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip
+          generate_release_notes: true
+          body: |
+            ## 下载说明
+
+            | 平台 | 文件 |
+            | --- | --- |
+            | Windows x64 | `remote-fs-windows-x64.zip` |
+            | Windows ARM64 | `remote-fs-windows-arm64.zip` |
+            | Linux x64 | `remote-fs-linux-x64.zip` |
+            | Linux ARM64 | `remote-fs-linux-arm64.zip` |
+            | macOS x64 | `remote-fs-macos-x64.zip` |
+            | macOS ARM64 | `remote-fs-macos-arm64.zip` |
+
+            解压后直接运行 `remote-fs`（Windows 下为 `remote-fs.exe`），无需安装 .NET 运行时。
+
+            ### 接入 Claude Code
+
+            ```bash
+            remote-fs hosts add web1
+            remote-fs hosts fingerprint web1
+            ```

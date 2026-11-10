@@ -1,0 +1,28 @@
+# 构建产物
+bin/
+obj/
+publish/
+*.user
+*.suo
+.vs/
+
+# 发布目录
+artifacts/
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 系统
+Thumbs.db
+.DS_Store
+
+# 敏感配置，绝不能提交
+hosts.json
+config.json
+*.pem
+*.key
+*.ppk
+id_rsa*
