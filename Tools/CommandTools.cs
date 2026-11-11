@@ -245,9 +245,11 @@ public sealed class CommandTools
 
                 if (hosts.Count == 0)
                 {
+                    // 路径必须如实反映实际位置，写死 ~ 会把用户引到错误的地方
+                    var hostsFile = System.IO.Path.Combine(ConfigStore.ConfigDirectory, "hosts.json");
                     return ToolResult.Ok(
-                        "尚未配置任何主机。请使用 remote-fs hosts add <别名> 命令添加，"
-                        + "配置文件位于 ~/.remote-fs/hosts.json。");
+                        $"尚未配置任何主机。请使用 remote-fs hosts add <别名> 命令添加，"
+                        + $"当前主机配置文件路径为 {hostsFile}。");
                 }
 
                 var builder = new StringBuilder();

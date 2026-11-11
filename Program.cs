@@ -219,10 +219,11 @@ public static class Program
               remote-fs hosts import [别名...]  从 ~/.ssh/config 导入主机
               remote-fs config show              查看当前全局配置
               remote-fs version                  显示版本号
-
-            配置文件:
-              ~/.remote-fs/hosts.json   主机列表
-              ~/.remote-fs/config.json  全局配置
             """);
+
+        // 配置目录随安装位置走，这里必须如实打印，避免用户按旧路径去找
+        Console.WriteLine($"配置文件目录: {ConfigStore.ConfigDirectory}");
+        Console.WriteLine("  hosts.json   主机列表");
+        Console.WriteLine("  config.json  全局配置");
     }
 }

@@ -61,16 +61,58 @@ public sealed class RemoteFsService : IDisposable
     /// </summary>
     public HostProfile ResolveHost(string? hostName)
     {
-        if (string.IsNullOrWhiteSpace(hostName))
+        var name = ResolveHostName(hostName);
+
+        // 1.1 先走内存缓存，避免每次调用都读盘
+        try
         {
-            if (string.IsNullOrWhiteSpace(_config.DefaultHost))
-            {
-                throw new InvalidOperationException(
-                    "未指定主机且未配置 defaultHost。请在工具参数中传入 host，或设置默认主机。");
-            }
-            return _configStore.RequireHost(_config.DefaultHost, _hostCache);
+            return _configStore.RequireHost(name, _hostCache);
         }
-        return _configStore.RequireHost(hostName, _hostCache);
+        catch (KeyNotFoundException)
+        {
+            // 1.2 没命中就重读一次：
+            // MCP 服务是常驻进程，用户在 GUI 里新增的主机不能要求重启客户端才生效
+            RefreshHostCache();
+            return _configStore.RequireHost(name, _hostCache);
+        }
+    }
+
+    /// <summary>
+    /// 解析目标主机名：未指定时回落到默认主机
+    /// </summary>
+    private string ResolveHostName(string? hostName)
+    {
+        if (!string.IsNullOrWhiteSpace(hostName))
+        {
+            return hostName;
+        }
+
+        if (string.IsNullOrWhiteSpace(_config.DefaultHost))
+        {
+            throw new InvalidOperationException(
+                "未指定主机且未配置 defaultHost。请在工具参数中传入 host，或设置默认主机。");
+        }
+        return _config.DefaultHost;
+    }
+
+    /// <summary>
+    /// 重新读取主机配置文件
+    /// </summary>
+    private void RefreshHostCache()
+    {
+        try
+        {
+            var reloaded = _configStore.LoadHosts();
+            _hostCache.Clear();
+            _hostCache.AddRange(reloaded);
+            AuditLogger.Info($"工具调用未命中主机缓存，已重新读取主机配置，共 {reloaded.Count} 台");
+        }
+        catch (Exception exception)
+        {
+            // 配置文件损坏时保留旧缓存，不要让所有工具一起不可用
+            AuditLogger.Warn(
+                $"重新读取主机配置失败，继续使用内存中的 {_hostCache.Count} 台主机: {exception.Message}");
+        }
     }
 
     /// <summary>
