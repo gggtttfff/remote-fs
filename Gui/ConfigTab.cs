@@ -26,6 +26,9 @@ public sealed class ConfigTab : UserControl
     private readonly CheckBox _followSymbolicLinksCheckBox = new();
     private readonly CheckBox _cacheEnabledCheckBox = new();
     private readonly NumericUpDown _cacheTtlSecondsBox = new();
+    private readonly NumericUpDown _backgroundJobTtlBox = new();
+    private readonly NumericUpDown _jobRetentionDaysBox = new();
+    private readonly NumericUpDown _jobMaxCountBox = new();
     private readonly CheckBox _stayInBackgroundCheckBox = new();
     private readonly CheckBox _startWithWindowsCheckBox = new();
     private readonly Label _statusLabel = new();
@@ -126,14 +129,23 @@ public sealed class ConfigTab : UserControl
         AddRow(table, "缓存有效期(秒)", CreateNumberBox(_cacheTtlSecondsBox, 1, 3600),
             "超过后重新枚举；写操作会立即让缓存失效");
 
-        // 5. 程序行为
+        // 5. 远程任务
+        AddSectionTitle(table, "远程任务");
+        AddRow(table, "后台任务时长(分钟)", CreateNumberBox(_backgroundJobTtlBox, 1, 1_440),
+            "background 任务的默认最长运行时间，到期由远程看护进程强制终止");
+        AddRow(table, "任务保留天数", CreateNumberBox(_jobRetentionDaysBox, 1, 365),
+            "已结束的任务目录超过该天数后自动清理");
+        AddRow(table, "每主机任务上限", CreateNumberBox(_jobMaxCountBox, 1, 1_000),
+            "每台主机最多保留的已结束任务数，超出后从最旧的开始清理");
+
+        // 6. 程序行为
         AddSectionTitle(table, "程序行为");
         AddRow(table, "关闭窗口驻留后台", _stayInBackgroundCheckBox,
             "开启后点关闭只收进托盘，进程继续驻留；从托盘菜单选「退出」才真正结束");
         AddRow(table, "开机自动启动", _startWithWindowsCheckBox,
             "写入当前用户的启动项，开机后自动打开配置界面，不需要管理员权限");
 
-        // 6. 路径说明
+        // 7. 路径说明
         AddSectionTitle(table, "数据位置");
         _pathsLabel.Dock = DockStyle.Fill;
         _pathsLabel.AutoSize = false;
@@ -286,6 +298,9 @@ public sealed class ConfigTab : UserControl
         _followSymbolicLinksCheckBox.Checked = config.FollowSymbolicLinks;
         _cacheEnabledCheckBox.Checked = config.CacheEnabled;
         _cacheTtlSecondsBox.Value = Math.Clamp(config.CacheTtlSeconds, 1, 3600);
+        _backgroundJobTtlBox.Value = Math.Clamp(config.BackgroundJobTtlMinutes, 1, 1_440);
+        _jobRetentionDaysBox.Value = Math.Clamp(config.JobRetentionDays, 1, 365);
+        _jobMaxCountBox.Value = Math.Clamp(config.JobMaxCount, 1, 1_000);
         _stayInBackgroundCheckBox.Checked = config.StayInBackgroundOnExit;
 
         // 开机启动以注册表为准，不信任配置文件里的镜像
@@ -327,6 +342,9 @@ public sealed class ConfigTab : UserControl
             config.FollowSymbolicLinks = _followSymbolicLinksCheckBox.Checked;
             config.CacheEnabled = _cacheEnabledCheckBox.Checked;
             config.CacheTtlSeconds = (int)_cacheTtlSecondsBox.Value;
+            config.BackgroundJobTtlMinutes = (int)_backgroundJobTtlBox.Value;
+            config.JobRetentionDays = (int)_jobRetentionDaysBox.Value;
+            config.JobMaxCount = (int)_jobMaxCountBox.Value;
             config.StayInBackgroundOnExit = _stayInBackgroundCheckBox.Checked;
 
             _configStore.SaveConfig(config);

@@ -90,16 +90,6 @@ public static class Program
         // 日志就绪后再准备配置目录，这样旧配置迁移的记录能落进日志文件
         ConfigStore.EnsureInitialized();
 
-        using var service = new RemoteFsService(config, configStore);
-
-        var tools = new List<ToolDefinition>();
-        tools.AddRange(new FileReadTools(service).Build());
-        tools.AddRange(new FileWriteTools(service).Build());
-        tools.AddRange(new CommandTools(service).Build());
-        tools.AddRange(new TransferTools(service).Build());
-
-        AuditLogger.Info($"已注册 {tools.Count} 个 MCP 工具");
-
         using var cancellation = new CancellationTokenSource();
         Console.CancelKeyPress += (_, eventArgs) =>
         {
@@ -107,31 +97,63 @@ public static class Program
             cancellation.Cancel();
         };
 
-        // 主机解析器只用于日志归类，日志记不住时也不该影响正常调用
-        var server = new McpStdioServer(
-            tools,
-            () =>
+        try
+        {
+            using (var service = new RemoteFsService(config, configStore))
             {
-                try
-                {
-                    return service.ResolveHost(null).Name;
-                }
-                catch (Exception)
-                {
-                    return null;
-                }
-            },
-            (toolName, hostName) =>
-            {
-                if (hostName is not null)
-                {
-                    service.Cache.InvalidateHost(hostName);
-                }
-            });
-        await server.RunAsync(cancellation.Token);
+                var tools = new List<ToolDefinition>();
+                tools.AddRange(new FileReadTools(service).Build());
+                tools.AddRange(new FileWriteTools(service).Build());
+                tools.AddRange(new CommandTools(service).Build());
+                tools.AddRange(new JobTools(service).Build());
+                tools.AddRange(new TransferTools(service).Build());
 
-        // 退出前把攒着的日志落盘
-        AuditLogger.Flush();
+                AuditLogger.Info($"已注册 {tools.Count} 个 MCP 工具");
+
+                // 主机解析器只用于日志归类，日志记不住时也不该影响正常调用
+                var server = new McpStdioServer(
+                    tools,
+                    () =>
+                    {
+                        try
+                        {
+                            return service.ResolveHost(null).Name;
+                        }
+                        catch (Exception)
+                        {
+                            return null;
+                        }
+                    },
+                    (toolName, hostName) =>
+                    {
+                        if (hostName is not null)
+                        {
+                            service.Cache.InvalidateHost(hostName);
+                        }
+                    });
+
+                // 兜底：进程被强制结束时也尽量把远程任务收掉，避免留下孤儿构建
+                AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+                {
+                    try
+                    {
+                        service.Jobs.KillAllStarted();
+                    }
+                    catch (Exception)
+                    {
+                        // 进程正在退出，这里没有补救余地
+                    }
+                };
+
+                await server.RunAsync(cancellation.Token);
+            }
+        }
+        finally
+        {
+            // service 释放时会先终止远程任务再关闭连接池，之后才轮到日志落盘
+            AuditLogger.Flush();
+        }
+
         return 0;
     }
 

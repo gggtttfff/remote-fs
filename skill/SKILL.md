@@ -5,7 +5,7 @@ description: 通过 remote-fs MCP 直接操作远程服务器文件与命令，�
 
 # 远程服务器操作
 
-19 个工具。`host` 参数省略时用配置里的默认主机；不确定别名先调 `remote_list_hosts`。
+22 个工具。`host` 参数省略时用配置里的默认主机；不确定别名先调 `remote_list_hosts`。
 
 ## 工具速查
 
@@ -21,6 +21,8 @@ description: 通过 remote-fs MCP 直接操作远程服务器文件与命令，�
 | 权限链接 | `remote_chmod` / `remote_symlink` | 八进制如 644 |
 | 传输 | `remote_download` / `remote_upload` / `remote_download_dir` | 默认不覆盖 |
 | 跑命令 | `remote_exec` | 退出码非 0 即失败，原因在 stderr 段 |
+| 长任务 | `remote_exec(background)` → `remote_job_status` | 立即拿任务号，增量读输出 |
+| 管任务 | `remote_job_list` / `remote_job_kill` | 列任务、按进程组终止 |
 
 ## 决策流程
 
@@ -54,6 +56,27 @@ description: 通过 remote-fs MCP 直接操作远程服务器文件与命令，�
 
 `remote_exec` 用于非文件操作：重启服务、查进程、看日志。退出码非 0 时工具返回错误结果，真实原因要读 stderr 段。
 
+**编译、构建、跑测试这类超过几十秒的命令，一律加 `background=true`**：
+
+```
+remote_exec(command="npm run build", background=true, ttlMinutes=20)
+  → 任务已提交: job-20261111-153012-a3f2
+remote_job_status(jobId="job-20261111-153012-a3f2")
+  → 已运行 42 秒 + 新增日志 + nextStdoutOffset: 8192
+remote_job_status(jobId="...", stdoutOffset=8192)
+  → 只返回新增部分，不会重复
+```
+
+要点：
+
+- **把上次返回的 `nextStdoutOffset` / `nextStderrOffset` 传回去**，否则会重复读到旧内容
+- 状态为 `已结束（退出码 0）` 才算成功；`已超时终止` / `已手动终止` / `异常终止` 都是失败
+- 长任务不需要了用 `remote_job_kill`，信号下发到整个进程组，不会留下子进程
+- `ttlMinutes` 是硬上限，到期由服务器上的看护进程强制终止——**即使 MCP 服务已经挂掉也会生效**
+- 前台模式超时不会再丢输出：工具会返回终止前已产生的内容
+
+服务重启后遗留的任务用 `remote_job_list` 找，能看到所有还挂在服务器上的任务。
+
 ## 必须知道的限制
 
 - **路径白名单**：主机配置了 `allowedRoots` 时越界路径直接拒绝，`remote_exec` 同样受限。这是用户主动设定的安全边界，**不要尝试绕过**，被拒就说明情况请用户调整
@@ -61,6 +84,7 @@ description: 通过 remote-fs MCP 直接操作远程服务器文件与命令，�
 - **`remote_move` 默认不覆盖**：目标已存在时会失败，确认要覆盖才传 `overwrite=true`
 - **删除目录必须 `recursive=true`**，非空目录否则报错；软链接只删链接本身，不会跟进目标
 - **`remote_exec` 的路径防护是尽力而为**：能拦显式绝对路径和相对 `..`，但变量拼接、命令替换拦不住。全局 `remoteExecPolicy` 设为 `Deny` 时该工具直接不可用
+- **任务目录不要手动删**：任务文件在 `~/.remote-fs/jobs/<jobId>/`，删掉正在运行任务的目录会让它的状态查询失效
 - **审计日志**写在 **exe 同级的 `log/`**（JSONL），含完整出入参，排查问题先看这里
 
 ## 报错对照

@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using RemoteFs.Common;
+using RemoteFs.Config;
 using RemoteFs.Mcp;
 using RemoteFs.Services;
 using RemoteFs.Ssh;
@@ -42,15 +43,23 @@ public sealed class CommandTools
             {
                 ("host", SchemaBuilder.String("目标主机别名，未指定则使用默认主机")),
                 ("command", SchemaBuilder.String("要在远程主机执行的 shell 命令")),
-                ("timeout", SchemaBuilder.Integer("超时毫秒数，默认取主机配置值", 1000, 600000))
+                ("timeout", SchemaBuilder.Integer(
+                    "前台等待的超时毫秒数，超时后终止整个进程组并返回已产生的输出；默认取主机配置值",
+                    1000, 3_600_000)),
+                ("background", SchemaBuilder.Boolean(
+                    "是否后台运行。开启后立即返回任务编号，用 remote_job_status 增量查看输出", false)),
+                ("ttlMinutes", SchemaBuilder.Integer(
+                    "后台任务的最长运行分钟数，到期由远程看护进程强制终止；默认取全局配置", 1, 1_440))
             },
             new[] { "command" });
 
         return new ToolDefinition
         {
             Name = "remote_exec",
-            Description = "在远程主机上执行 shell 命令并返回标准输出、标准错误和退出码。"
-                + "适用于查看日志、重启服务、检查系统状态等非纯文件操作场景。"
+            Description = "在远程主机上执行 shell 命令。默认前台等待结束后一次性返回输出；"
+                + "长任务（编译、构建）建议设置 background=true 立即拿到任务编号，"
+                + "再用 remote_job_status 边跑边读输出、remote_job_kill 终止。"
+                + "超时或终止时会下发信号到整个进程组，不会留下孤儿进程。"
                 + "注意：命令中的路径防护是尽力而为，变量拼接等写法无法拦截，"
                 + "需要严格隔离时应把全局配置 remoteExecPolicy 设为 Deny。",
             InputSchema = schema,
@@ -60,39 +69,98 @@ public sealed class CommandTools
                 var profile = _service.ResolveHost(context.GetString("host"));
                 var command = context.RequireString("command");
                 var timeout = context.GetInt("timeout");
+                var background = context.GetBool("background");
+                var ttlMinutes = context.GetInt("ttlMinutes");
 
                 // 命令中引用的绝对路径同样受白名单约束，避免绕过文件工具的限制
                 _service.EnsureCommandAllowed(profile, command);
 
-                var output = _service.ExecuteCommand(profile, command, timeout);
+                // 1.1 后台任务必须有兜底时限，否则提交完忘了就会漏跑
+                var ttlSeconds = Math.Clamp(
+                    (ttlMinutes ?? _service.Config.BackgroundJobTtlMinutes) * 60, 60, 86_400);
+                var handle = _service.Jobs.StartJob(profile, command, ttlSeconds);
 
-                var builder = new StringBuilder();
-                builder.AppendLine($"命令: {command}");
-                builder.AppendLine($"主机: {profile.Name}");
-                builder.AppendLine($"退出码: {output.ExitCode}");
-
-                if (!string.IsNullOrWhiteSpace(output.StandardOutput))
+                // 2.1 后台模式立即返回，让调用方自己轮询
+                if (background)
                 {
-                    builder.AppendLine("--- 标准输出 ---");
-                    builder.AppendLine(output.StandardOutput.TrimEnd());
-                }
-                if (!string.IsNullOrWhiteSpace(output.StandardError))
-                {
-                    builder.AppendLine("--- 标准错误 ---");
-                    builder.AppendLine(output.StandardError.TrimEnd());
-                }
-                if (string.IsNullOrWhiteSpace(output.StandardOutput)
-                    && string.IsNullOrWhiteSpace(output.StandardError))
-                {
-                    builder.AppendLine("（无输出）");
+                    return ToolResult.Ok(FormatSubmitted(profile, handle, ttlSeconds));
                 }
 
-                var text = _service.TruncateOutput(builder.ToString());
-                return output.ExitCode == 0
-                    ? ToolResult.Ok(text)
-                    : ToolResult.Error(text);
+                // 3.1 前台模式等它结束，超时就终止进程组并保留已产生的输出
+                var foregroundTimeout = timeout ?? profile.CommandTimeoutMilliseconds;
+                var result = _service.Jobs.WaitForCompletion(profile, handle, foregroundTimeout);
+
+                var text = _service.TruncateOutput(FormatCompleted(profile, command, result));
+                var succeeded = !result.TimedOut && result.ExitCode == 0;
+                return succeeded ? ToolResult.Ok(text) : ToolResult.Error(text);
             }
         };
+    }
+
+    /// <summary>
+    /// 后台任务提交后的回执
+    /// </summary>
+    private static string FormatSubmitted(HostProfile profile, RemoteJobHandle handle, int ttlSeconds)
+    {
+        var builder = new StringBuilder();
+        builder.AppendLine($"任务已提交: {handle.JobId}");
+        builder.AppendLine($"主机: {profile.Name}");
+        builder.AppendLine($"命令: {handle.Command}");
+        builder.AppendLine($"最长运行: {ttlSeconds / 60} 分钟，到期由远程看护进程强制终止");
+        builder.AppendLine($"任务目录: {handle.RemoteDirectory}");
+        builder.AppendLine("后续: 用 remote_job_status 拉取增量输出，用 remote_job_kill 提前终止。");
+        return builder.ToString();
+    }
+
+    /// <summary>
+    /// 前台任务结束或超时后的结果
+    /// </summary>
+    private static string FormatCompleted(
+        HostProfile profile, string command, ForegroundJobResult result)
+    {
+        var builder = new StringBuilder();
+        builder.AppendLine($"命令: {command}");
+        builder.AppendLine($"主机: {profile.Name}");
+        builder.AppendLine($"任务: {result.Handle.JobId}");
+
+        if (result.TimedOut)
+        {
+            builder.AppendLine("状态: 已超时终止，整个进程组已收到终止信号");
+        }
+        else if (result.ExitCode is null)
+        {
+            builder.AppendLine("退出码: 未知（进程结束时没有写出退出码）");
+        }
+        else
+        {
+            builder.AppendLine($"退出码: {result.ExitCode}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(result.StandardOutput))
+        {
+            builder.AppendLine(result.TimedOut ? "--- 标准输出（终止前已产生） ---" : "--- 标准输出 ---");
+            builder.AppendLine(result.StandardOutput.TrimEnd());
+        }
+
+        if (!string.IsNullOrWhiteSpace(result.StandardError))
+        {
+            builder.AppendLine(result.TimedOut ? "--- 标准错误（终止前已产生） ---" : "--- 标准错误 ---");
+            builder.AppendLine(result.StandardError.TrimEnd());
+        }
+
+        if (string.IsNullOrWhiteSpace(result.StandardOutput)
+            && string.IsNullOrWhiteSpace(result.StandardError))
+        {
+            builder.AppendLine("（无输出）");
+        }
+
+        if (result.Truncated)
+        {
+            builder.AppendLine(
+                "[输出超过单次读取上限，只返回了前面的部分。完整内容可在任务目录的 out / err 文件中查看]");
+        }
+
+        return builder.ToString();
     }
 
     /// <summary>

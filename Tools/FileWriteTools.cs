@@ -314,11 +314,11 @@ public sealed class FileWriteTools
                         }
                     }
                     // rm -rf 对符号链接只删链接本身，不会跟进目标
-                    RunCommandOrThrow(profile, $"rm -rf -- {ShellQuote(path)}");
+                    RunCommandOrThrow(profile, $"rm -rf -- {ShellQuoting.Quote(path)}");
                 }
                 else if (isSymbolicLink)
                 {
-                    RunCommandOrThrow(profile, $"rm -f -- {ShellQuote(path)}");
+                    RunCommandOrThrow(profile, $"rm -f -- {ShellQuoting.Quote(path)}");
                 }
                 else
                 {
@@ -499,7 +499,7 @@ public sealed class FileWriteTools
                 // 改用服务端自带的 chmod，结果与手工执行完全一致
                 var octalDisplay = Convert.ToString(permissions, 8).PadLeft(3, '0');
                 var output = _service.ExecuteCommand(
-                    profile, $"chmod {octalDisplay} {ShellQuote(path)}", null);
+                    profile, $"chmod {octalDisplay} {ShellQuoting.Quote(path)}", null);
                 if (output.ExitCode != 0)
                 {
                     return ToolResult.Error(
@@ -649,14 +649,6 @@ public sealed class FileWriteTools
             throw new InvalidOperationException(
                 $"执行 {command} 失败（退出码 {output.ExitCode}）：{output.StandardError.Trim()}");
         }
-    }
-
-    /// <summary>
-    /// 用单引号包裹 shell 参数，内部单引号按 POSIX 规则转义
-    /// </summary>
-    private static string ShellQuote(string value)
-    {
-        return "'" + value.Replace("'", "'\\''") + "'";
     }
 
     /// <summary>

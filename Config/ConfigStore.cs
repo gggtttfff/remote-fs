@@ -84,6 +84,15 @@ public sealed class AppConfig
     /// <summary>目录枚举缓存的有效期（秒），超时后重新枚举</summary>
     public int CacheTtlSeconds { get; set; } = 30;
 
+    /// <summary>后台任务的最长运行时间（分钟），到期由远程看护进程强制终止</summary>
+    public int BackgroundJobTtlMinutes { get; set; } = 30;
+
+    /// <summary>远程任务目录的保留天数，超期且已结束的任务会被清理</summary>
+    public int JobRetentionDays { get; set; } = 7;
+
+    /// <summary>每台主机最多保留的已结束任务数，超出后按时间从旧到新清理</summary>
+    public int JobMaxCount { get; set; } = 50;
+
     /// <summary>关闭主窗口时是否驻留后台（托盘），而不是退出进程</summary>
     public bool StayInBackgroundOnExit { get; set; }
 

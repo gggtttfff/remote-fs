@@ -18,6 +18,7 @@ public sealed class RemoteFsService : IDisposable
     private readonly PathGuard _pathGuard;
     private readonly Cache.CacheStore _cacheStore;
     private readonly List<HostProfile> _hostCache;
+    private readonly RemoteJobManager _jobManager;
 
     public RemoteFsService(AppConfig config, ConfigStore configStore)
     {
@@ -29,9 +30,13 @@ public sealed class RemoteFsService : IDisposable
         _cacheStore = new Cache.CacheStore(config);
         _cacheStore.Initialize();
         _hostCache = configStore.LoadHosts();
+        _jobManager = new RemoteJobManager(config, _connectionFactory, _sftpPool);
     }
 
     public AppConfig Config => _config;
+
+    /// <summary>远程任务管理器，供命令执行类工具使用</summary>
+    public RemoteJobManager Jobs => _jobManager;
 
     /// <summary>缓存存储，供工具层使用</summary>
     public Cache.CacheStore Cache => _cacheStore;
@@ -195,6 +200,9 @@ public sealed class RemoteFsService : IDisposable
 
     public void Dispose()
     {
+        // 先终止任务再关闭连接池：清理阶段还要连远程下发终止信号
+        _jobManager.KillAllStarted();
+        _jobManager.Dispose();
         _sftpPool.Dispose();
     }
 }
