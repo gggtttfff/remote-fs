@@ -7,7 +7,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>RemoteFs</AssemblyName>
     <RootNamespace>RemoteFs</RootNamespace>
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
@@ -15,10 +15,31 @@
   <PropertyGroup>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
-    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <!-- 命令行未指定 RID 时默认本机开发用的 win-x64，CI 会通过 -r 覆盖 -->
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <DebugType>none</DebugType>
   </PropertyGroup>
+
+  <!--
+    配置界面用 WinForms，仅 Windows 目标启用：
+    1. 宿主是 Windows 且目标是 win-* 时才切换到 net9.0-windows
+    2. Linux/macOS 产物保持纯控制台，跨平台矩阵不受影响
+  -->
+  <PropertyGroup>
+    <_TargetIsWindows Condition="$(RuntimeIdentifier.StartsWith('win'))">true</_TargetIsWindows>
+  </PropertyGroup>
+  <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('Windows')) and '$(_TargetIsWindows)' == 'true'">
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <EnableWindowsGui>true</EnableWindowsGui>
+    <DefineConstants>$(DefineConstants);WINDOWS_GUI</DefineConstants>
+  </PropertyGroup>
+
+  <!-- 非 Windows 目标不编译 GUI 目录，否则会因缺少 WinForms 引用而失败 -->
+  <ItemGroup Condition="'$(EnableWindowsGui)' != 'true'">
+    <Compile Remove="Gui/**/*.cs" />
+  </ItemGroup>
 
   <ItemGroup>
     <!-- SSH.NET：纯托管 SSH/SFTP 实现，不依赖系统 OpenSSH 客户端。

@@ -51,7 +51,14 @@ public sealed class HostProfile
     public string? KnownHostKeyFingerprint { get; set; }
 
     /// <summary>允许访问的路径根目录。空列表表示不限制（会在日志中告警）</summary>
-    public List<string> AllowedRoots { get; set; } = new();
+    public List<string> AllowedRoots
+    {
+        get => _allowedRoots;
+        // 配置文件里写成 null 时兜底为空列表，避免后续 Count/遍历抛空引用
+        set => _allowedRoots = value ?? new List<string>();
+    }
+
+    private List<string> _allowedRoots = new();
 
     /// <summary>命令执行超时（毫秒）</summary>
     public int CommandTimeoutMilliseconds { get; set; } = 60_000;

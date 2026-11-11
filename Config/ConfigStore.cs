@@ -5,6 +5,21 @@ using RemoteFs.Common;
 namespace RemoteFs.Config;
 
 /// <summary>
+/// 远程命令执行策略
+/// </summary>
+public enum RemoteExecPolicy
+{
+    /// <summary>完全禁用 remote_exec</summary>
+    Deny,
+
+    /// <summary>放行，但拦截命令中显式引用的白名单外绝对路径（尽力而为，无法防御变量拼接等写法）</summary>
+    Guard,
+
+    /// <summary>完全放行，不做路径检查</summary>
+    Allow
+}
+
+/// <summary>
 /// 全局配置
 /// </summary>
 public sealed class AppConfig
@@ -33,6 +48,45 @@ public sealed class AppConfig
     /// <summary>是否记录审计日志</summary>
     public bool AuditLogEnabled { get; set; } = true;
 
+    /// <summary>日志等级，低于该等级的不写入</summary>
+    public Logging.LogLevel LogLevel { get; set; } = Logging.LogLevel.Info;
+
+    /// <summary>是否记录工具调用的完整出入参。开启后服务器上的文件内容会明文落盘</summary>
+    public bool LogRecordPayloads { get; set; } = true;
+
+    /// <summary>单个日志文件的大小上限（字节），超过后自动分割</summary>
+    public long LogMaxFileSizeBytes { get; set; } = 10 * 1024 * 1024;
+
+    /// <summary>日志保留天数，超过后自动清理</summary>
+    public int LogRetentionDays { get; set; } = 7;
+
+    /// <summary>最多保留的日志文件数</summary>
+    public int LogMaxFiles { get; set; } = 20;
+
+    /// <summary>SSH 连接超时（毫秒）</summary>
+    public int ConnectionTimeoutMilliseconds { get; set; } = 30_000;
+
+    /// <summary>SFTP 单次操作超时（毫秒），避免远端无响应时永久卡住</summary>
+    public int SftpOperationTimeoutMilliseconds { get; set; } = 60_000;
+
+    /// <summary>SFTP 连接空闲多久后回收（秒）</summary>
+    public int ConnectionIdleSeconds { get; set; } = 300;
+
+    /// <summary>remote_exec 的路径防护策略</summary>
+    public RemoteExecPolicy RemoteExecPolicy { get; set; } = RemoteExecPolicy.Guard;
+
+    /// <summary>是否允许操作符号链接。默认拒绝，防止借道软链接跳出白名单</summary>
+    public bool FollowSymbolicLinks { get; set; }
+
+    /// <summary>是否启用远程目录枚举缓存</summary>
+    public bool CacheEnabled { get; set; } = true;
+
+    /// <summary>目录枚举缓存的有效期（秒），超时后重新枚举</summary>
+    public int CacheTtlSeconds { get; set; } = 30;
+
+    /// <summary>关闭主窗口时是否驻留后台（托盘），而不是退出进程</summary>
+    public bool StayInBackgroundOnExit { get; set; }
+
     /// <summary>主机配置文件路径</summary>
     public string? HostsFilePath { get; set; }
 }
@@ -59,7 +113,9 @@ public sealed class ConfigStore
         _configFilePath = Path.Combine(ConfigDirectory, "config.json");
     }
 
-    /// <summary>配置根目录，可用 REMOTE_FS_HOME 环境变量覆盖</summary>
+    /// <summary>
+    /// 配置根目录：程序所在目录下的 config，可用 REMOTE_FS_HOME 环境变量覆盖
+    /// </summary>
     public static string ConfigDirectory
     {
         get
@@ -69,9 +125,87 @@ public sealed class ConfigStore
             {
                 return custom;
             }
-            return Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                ".remote-fs");
+            return Path.Combine(InstallRoot, "config");
+        }
+    }
+
+    /// <summary>
+    /// 缓存根目录：程序所在目录下的 cache
+    /// </summary>
+    public static string CacheDirectory => Path.Combine(InstallRoot, "cache");
+
+    /// <summary>
+    /// 程序安装目录（单文件发布下就是 exe 所在目录）
+    /// </summary>
+    public static string InstallRoot => AppContext.BaseDirectory;
+
+    /// <summary>
+    /// 旧版本的配置目录，用于一次性迁移
+    /// </summary>
+    private static string LegacyConfigDirectory => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".remote-fs");
+
+    /// <summary>
+    /// 准备配置目录。首次运行时把旧目录里的配置复制过来，原件保留不删。
+    /// </summary>
+    public static void EnsureInitialized()
+    {
+        try
+        {
+            Directory.CreateDirectory(ConfigDirectory);
+            // 缓存目录跟着配置目录一起准备，任何子命令启动都会有
+            Cache.CacheStore.EnsureDirectories();
+        }
+        catch (Exception exception)
+        {
+            AuditLogger.Warn($"无法创建配置目录 {ConfigDirectory}: {exception.Message}");
+            return;
+        }
+
+        MigrateLegacyConfig();
+    }
+
+    /// <summary>
+    /// 把 ~/.remote-fs 下的旧配置复制到新的 config 目录，只在新目录还没有对应文件时复制
+    /// </summary>
+    private static void MigrateLegacyConfig()
+    {
+        // 指定了 REMOTE_FS_HOME 说明是显式指定位置，不做迁移
+        if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("REMOTE_FS_HOME")))
+        {
+            return;
+        }
+
+        var legacyDirectory = LegacyConfigDirectory;
+        if (!Directory.Exists(legacyDirectory)
+            || string.Equals(
+                Path.GetFullPath(legacyDirectory), Path.GetFullPath(ConfigDirectory),
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        foreach (var fileName in new[] { "hosts.json", "config.json" })
+        {
+            var legacyPath = Path.Combine(legacyDirectory, fileName);
+            var targetPath = Path.Combine(ConfigDirectory, fileName);
+
+            if (!File.Exists(legacyPath) || File.Exists(targetPath))
+            {
+                continue;
+            }
+
+            try
+            {
+                File.Copy(legacyPath, targetPath);
+                AuditLogger.Info(
+                    $"已把旧配置 {legacyPath} 复制到 {targetPath}，旧文件保留未删除");
+            }
+            catch (Exception exception)
+            {
+                AuditLogger.Warn($"迁移旧配置 {legacyPath} 失败: {exception.Message}");
+            }
         }
     }
 
@@ -128,6 +262,24 @@ public sealed class ConfigStore
     {
         var json = JsonSerializer.Serialize(hosts, JsonOptions);
         AtomicFileWriter.WriteAllText(_hostsFilePath, json);
+        WarnPlaintextPasswords(hosts);
+    }
+
+    /// <summary>
+    /// 明文密码会随配置文件一起备份、同步、截图，出现即告警
+    /// </summary>
+    private void WarnPlaintextPasswords(List<HostProfile> hosts)
+    {
+        var plaintextHosts = hosts
+            .Where(host => !string.IsNullOrEmpty(host.Password))
+            .Select(host => host.Name)
+            .ToList();
+        if (plaintextHosts.Count > 0)
+        {
+            AuditLogger.Warn(
+                $"以下主机的登录密码以明文保存在 {_hostsFilePath}：{string.Join(", ", plaintextHosts)}。"
+                + "建议改用 passwordEnvironmentVariable 从环境变量读取。");
+        }
     }
 
     /// <summary>按别名查找主机，找不到时抛出可读异常</summary>

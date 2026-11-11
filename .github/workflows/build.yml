@@ -60,9 +60,7 @@ jobs:
       - name: 还原依赖
         run: dotnet restore RemoteFs.csproj
 
-      - name: 编译
-        run: dotnet build RemoteFs.csproj -c Release --no-restore
-
+      # publish 内部会编译，不再单独 build 一遍
       - name: 发布单文件
         run: >
           dotnet publish RemoteFs.csproj
@@ -119,6 +117,9 @@ jobs:
             | macOS ARM64 | `remote-fs-macos-arm64.zip` |
 
             解压后直接运行 `remote-fs`（Windows 下为 `remote-fs.exe`），无需安装 .NET 运行时。
+
+            > Windows 版本额外提供图形配置界面：运行 `remote-fs gui` 即可打开主机编辑器。
+            > Linux / macOS 版本为纯命令行，配置请使用 `remote-fs hosts` 子命令。
 
             ### 接入 Claude Code
 

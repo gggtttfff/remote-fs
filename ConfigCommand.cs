@@ -13,6 +13,7 @@ public static class ConfigCommand
     {
         if (args.Length == 0 || args[0].ToLowerInvariant() == "show")
         {
+            ConfigStore.EnsureInitialized();
             var configStore = new ConfigStore();
             var config = configStore.LoadConfig();
 

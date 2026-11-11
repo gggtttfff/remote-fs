@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using RemoteFs.Common;
+using RemoteFs.Config;
 using RemoteFs.Mcp;
 using RemoteFs.Services;
 using RemoteFs.Ssh;
@@ -13,6 +14,9 @@ namespace RemoteFs.Tools;
 /// </summary>
 public sealed class FileWriteTools
 {
+    /// <summary>递归复制与删除的深度上限，防止软链接或超深目录导致栈溢出</summary>
+    private const int MaxRecursionDepth = 64;
+
     private readonly RemoteFsService _service;
 
     public FileWriteTools(RemoteFsService service)
@@ -48,7 +52,7 @@ public sealed class FileWriteTools
             {
                 ("host", SchemaBuilder.String("目标主机别名，未指定则使用默认主机")),
                 ("path", SchemaBuilder.String("远程文件绝对路径")),
-                ("content", SchemaBuilder.String("要写入的文本内容")),
+                ("content", SchemaBuilder.String("要写入的文本内容，可为空字符串表示清空文件")),
                 ("append", SchemaBuilder.Boolean("是否追加到文件末尾，默认覆盖", false)),
                 ("createParents", SchemaBuilder.Boolean("父目录不存在时是否自动创建", true)),
                 ("permissions", SchemaBuilder.String("文件权限位，如 644，默认保留原有权限"))
@@ -61,18 +65,31 @@ public sealed class FileWriteTools
             Description = "将文本内容写入远程文件。默认覆盖整个文件，append=true 时追加到末尾。"
                 + "内容原样写入，不做 shell 转义，适合写配置文件。",
             InputSchema = schema,
+            Annotations = ToolAnnotations.Destructive,
             Handler = context =>
             {
                 var profile = _service.ResolveHost(context.GetString("host"));
                 var path = context.RequireString("path");
-                var content = context.RequireString("content");
+                // 空内容是合法写入意图（例如清空文件），用 RequireText 区分「没传」和「传了空串」
+                var content = context.RequireText("content");
                 var append = context.GetBool("append");
                 var createParents = context.GetBool("createParents", true);
-                var permissions = context.GetString("permissions");
+                var permissionsText = context.GetString("permissions");
 
+                // 权限值非法必须在写入之前拦下，否则文件已改却返回失败
+                short permissions = 0;
+                if (!string.IsNullOrWhiteSpace(permissionsText)
+                    && !TryParseOctalPermissions(permissionsText, out permissions))
+                {
+                    return ToolResult.Error($"权限值 '{permissionsText}' 不是合法的八进制权限，示例：644、755");
+                }
+
+                // 1.1 白名单先于连接校验，越界路径不触发任何远程调用
                 _service.EnsurePathAllowed(profile, path);
 
-                using var sftp = _service.OpenSftp(profile);
+                using var lease = _service.OpenSftp(profile);
+                var sftp = lease.Client;
+                _service.EnsureNotSymbolicLink(profile, sftp, path);
 
                 if (createParents)
                 {
@@ -89,14 +106,10 @@ public sealed class FileWriteTools
 
                 RemoteFileWriter.WriteText(sftp, path, content, append);
 
-                // 写入后按需调整权限位，权限值按八进制解析（如 644）
-                if (!string.IsNullOrWhiteSpace(permissions))
+                // 1.2 写入按需调整权限位，权限值按八进制解析（如 644）
+                if (!string.IsNullOrWhiteSpace(permissionsText))
                 {
-                    if (!TryParseOctalPermissions(permissions, out var mode))
-                    {
-                        return ToolResult.Error($"权限值 '{permissions}' 不是合法的八进制权限，示例：644、755");
-                    }
-                    sftp.ChangePermissions(path, mode);
+                    sftp.ChangePermissions(path, permissions);
                 }
 
                 var size = sftp.GetAttributes(path).Size;
@@ -119,7 +132,7 @@ public sealed class FileWriteTools
                 ("host", SchemaBuilder.String("目标主机别名，未指定则使用默认主机")),
                 ("path", SchemaBuilder.String("远程文件绝对路径")),
                 ("oldText", SchemaBuilder.String("要替换的原文本，必须精确匹配（含缩进与换行）")),
-                ("newText", SchemaBuilder.String("替换后的新文本")),
+                ("newText", SchemaBuilder.String("替换后的新文本，可为空字符串表示删除该段")),
                 ("replaceAll", SchemaBuilder.Boolean("是否替换所有匹配项，默认只替换第一处", false))
             },
             new[] { "path", "oldText", "newText" });
@@ -128,26 +141,41 @@ public sealed class FileWriteTools
         {
             Name = "remote_edit_file",
             Description = "在远程文件中替换指定文本。比整体重写文件更安全，不会误删未读到的内容。"
-                + "oldText 需精确匹配，匹配不到会报错并返回文件内容片段供确认。",
+                + "oldText 需精确匹配，匹配不到会报错并返回文件内容片段供确认。"
+                + "文件超过单次读取上限时会拒绝编辑，避免只写回读到的那一段。",
             InputSchema = schema,
+            Annotations = ToolAnnotations.Modifying,
             Handler = context =>
             {
                 var profile = _service.ResolveHost(context.GetString("host"));
                 var path = context.RequireString("path");
                 var oldText = context.RequireString("oldText");
-                var newText = context.GetString("newText") ?? string.Empty;
+                var newText = context.RequireText("newText");
                 var replaceAll = context.GetBool("replaceAll");
 
+                // 1.1 白名单先于连接校验，越界路径不触发任何远程调用
                 _service.EnsurePathAllowed(profile, path);
 
-                using var sftp = _service.OpenSftp(profile);
+                using var lease = _service.OpenSftp(profile);
+                var sftp = lease.Client;
+                _service.EnsureNotSymbolicLink(profile, sftp, path);
 
-                var (content, _, _) = RemoteFileReader.Read(sftp, path, 0, -1, _service.Config.MaxReadBytes);
+                var (content, totalLength, truncated) = RemoteFileReader.Read(
+                    sftp, path, 0, -1, _service.Config.MaxReadBytes);
+
+                // 1.2 只读到了文件的一部分，整体写回会静默截断
+                if (truncated)
+                {
+                    return ToolResult.Error(
+                        $"文件 {path} 大小 {totalLength} 字节，超过单次读取上限 {_service.Config.MaxReadBytes} 字节。"
+                        + "此时整体写回会丢失未读取的内容，已拒绝编辑。"
+                        + "请改用 remote_exec 配合 sed -i，或 remote_download → 本地修改 → remote_upload。");
+                }
+
                 var text = RemoteFileReader.TryDecodeText(content)
                     ?? throw new InvalidOperationException($"文件 {path} 是二进制内容，无法做文本替换");
 
-                var comparison = StringComparison.Ordinal;
-                var occurrences = CountOccurrences(text, oldText, comparison);
+                var occurrences = CountOccurrences(text, oldText);
                 if (occurrences == 0)
                 {
                     // 兜底：返回文件片段帮助模型定位问题
@@ -167,7 +195,7 @@ public sealed class FileWriteTools
                     ? text.Replace(oldText, newText, StringComparison.Ordinal)
                     : ReplaceFirst(text, oldText, newText);
 
-                // 原子写入：先写临时文件再重命名，避免写到一半失败损坏原文件
+                // 1.3 原子写入：先写临时文件再重命名，避免写到一半失败损坏原文件
                 RemoteFileWriter.WriteTextAtomic(sftp, path, updated);
 
                 var replacedCount = replaceAll ? occurrences : 1;
@@ -196,15 +224,19 @@ public sealed class FileWriteTools
             Name = "remote_mkdir",
             Description = "在远程主机上创建目录，可递归创建多级目录。目录已存在时不报错。",
             InputSchema = schema,
+            Annotations = ToolAnnotations.Modifying,
             Handler = context =>
             {
                 var profile = _service.ResolveHost(context.GetString("host"));
                 var path = context.RequireString("path");
                 var createParents = context.GetBool("createParents", true);
 
+                // 1.1 白名单先于连接校验，越界路径不触发任何远程调用
                 _service.EnsurePathAllowed(profile, path);
 
-                using var sftp = _service.OpenSftp(profile);
+                using var lease = _service.OpenSftp(profile);
+                var sftp = lease.Client;
+                _service.EnsureNotSymbolicLink(profile, sftp, path);
 
                 if (sftp.Exists(path))
                 {
@@ -245,41 +277,56 @@ public sealed class FileWriteTools
             Name = "remote_remove",
             Description = "删除远程文件或目录。删除目录需显式设置 recursive=true，否则非空目录会失败。",
             InputSchema = schema,
+            Annotations = ToolAnnotations.Destructive,
             Handler = context =>
             {
                 var profile = _service.ResolveHost(context.GetString("host"));
                 var path = context.RequireString("path");
                 var recursive = context.GetBool("recursive");
 
+                // 1.1 白名单先于连接校验，越界路径不触发任何远程调用
                 _service.EnsurePathAllowed(profile, path);
 
-                using var sftp = _service.OpenSftp(profile);
+                using var lease = _service.OpenSftp(profile);
+                var sftp = lease.Client;
 
                 if (!sftp.Exists(path))
                 {
                     return ToolResult.Ok($"路径 {path} 不存在，无需删除");
                 }
 
+                // 1.2 软链接必须走服务端 rm：SftpClient.DeleteFile 会解析链接并删掉目标文件
+                var isSymbolicLink = RemotePathInspector.IsSymbolicLink(sftp, path);
                 var attributes = sftp.GetAttributes(path);
-                if (attributes.IsDirectory)
+                var isDirectory = attributes.IsDirectory && !isSymbolicLink;
+
+                if (isDirectory)
                 {
                     if (!recursive)
                     {
-                        var entries = sftp.ListDirectory(path).ToList();
+                        var entries = sftp.ListDirectory(path)
+                            .Where(entry => entry.Name is not ("." or ".."))
+                            .ToList();
                         if (entries.Count > 0)
                         {
                             return ToolResult.Error(
                                 $"目录 {path} 非空（{entries.Count} 项）。请设置 recursive=true 递归删除。");
                         }
                     }
-                    DeleteDirectoryRecursive(sftp, path);
+                    // rm -rf 对符号链接只删链接本身，不会跟进目标
+                    RunCommandOrThrow(profile, $"rm -rf -- {ShellQuote(path)}");
+                }
+                else if (isSymbolicLink)
+                {
+                    RunCommandOrThrow(profile, $"rm -f -- {ShellQuote(path)}");
                 }
                 else
                 {
                     sftp.DeleteFile(path);
                 }
 
-                AuditLogger.Info($"删除路径 [{profile.Name}] {path} (recursive={recursive})");
+                AuditLogger.Info(
+                    $"删除路径 [{profile.Name}] {path} (recursive={recursive}, link={isSymbolicLink})");
                 return ToolResult.Ok($"已删除 {path}（主机 {profile.Name}）");
             }
         };
@@ -295,32 +342,47 @@ public sealed class FileWriteTools
             {
                 ("host", SchemaBuilder.String("目标主机别名，未指定则使用默认主机")),
                 ("source", SchemaBuilder.String("源路径绝对路径")),
-                ("destination", SchemaBuilder.String("目标路径绝对路径"))
+                ("destination", SchemaBuilder.String("目标路径绝对路径")),
+                ("overwrite", SchemaBuilder.Boolean("目标已存在时是否覆盖，默认不覆盖", false))
             },
             new[] { "source", "destination" });
 
         return new ToolDefinition
         {
             Name = "remote_move",
-            Description = "移动或重命名远程文件/目录。目标已存在时覆盖。",
+            Description = "移动或重命名远程文件/目录。目标已存在时默认失败，需显式设置 overwrite=true 才覆盖。",
             InputSchema = schema,
+            Annotations = ToolAnnotations.Destructive,
             Handler = context =>
             {
                 var profile = _service.ResolveHost(context.GetString("host"));
                 var source = context.RequireString("source");
                 var destination = context.RequireString("destination");
+                var overwrite = context.GetBool("overwrite");
 
+                // 1.1 白名单先于连接校验，越界路径不触发任何远程调用
                 _service.EnsurePathAllowed(profile, source);
                 _service.EnsurePathAllowed(profile, destination);
 
-                using var sftp = _service.OpenSftp(profile);
+                using var lease = _service.OpenSftp(profile);
+                var sftp = lease.Client;
+                _service.EnsureNotSymbolicLink(profile, sftp, source);
+                _service.EnsureNotSymbolicLink(profile, sftp, destination);
 
                 if (!sftp.Exists(source))
                 {
                     return ToolResult.Error($"源路径 {source} 不存在");
                 }
-                sftp.RenameFile(source, destination, true);
-                AuditLogger.Info($"移动路径 [{profile.Name}] {source} -> {destination}");
+
+                // 1.2 默认不覆盖，避免 AI 误伤已有文件
+                if (sftp.Exists(destination) && !overwrite)
+                {
+                    return ToolResult.Error(
+                        $"目标路径 {destination} 已存在。如需覆盖请设置 overwrite=true。");
+                }
+
+                sftp.RenameFile(source, destination, overwrite);
+                AuditLogger.Info($"移动路径 [{profile.Name}] {source} -> {destination} (overwrite={overwrite})");
                 return ToolResult.Ok($"已将 {source} 移动到 {destination}（主机 {profile.Name}）");
             }
         };
@@ -344,8 +406,9 @@ public sealed class FileWriteTools
         return new ToolDefinition
         {
             Name = "remote_copy",
-            Description = "复制远程文件或目录到另一位置。目录复制默认递归。",
+            Description = "在远程主机内部复制文件或目录，全程走 SFTP 读写，不经过本地磁盘。目录复制默认递归。",
             InputSchema = schema,
+            Annotations = ToolAnnotations.Modifying,
             Handler = context =>
             {
                 var profile = _service.ResolveHost(context.GetString("host"));
@@ -353,10 +416,14 @@ public sealed class FileWriteTools
                 var destination = context.RequireString("destination");
                 var recursive = context.GetBool("recursive", true);
 
+                // 1.1 白名单先于连接校验，越界路径不触发任何远程调用
                 _service.EnsurePathAllowed(profile, source);
                 _service.EnsurePathAllowed(profile, destination);
 
-                using var sftp = _service.OpenSftp(profile);
+                using var lease = _service.OpenSftp(profile);
+                var sftp = lease.Client;
+                _service.EnsureNotSymbolicLink(profile, sftp, source);
+                _service.EnsureNotSymbolicLink(profile, sftp, destination);
 
                 if (!sftp.Exists(source))
                 {
@@ -370,16 +437,13 @@ public sealed class FileWriteTools
                     {
                         return ToolResult.Error($"源路径 {source} 是目录，需要 recursive=true 才能复制");
                     }
-                    CopyDirectory(sftp, source, destination);
+                    CopyDirectory(sftp, source, destination, 0);
                 }
                 else
                 {
-                    var parent = RemoteFileWriter.GetParentDirectory(destination);
-                    RemoteFileWriter.EnsureDirectory(sftp, parent);
-                    using (var output = File.Open(destination, FileMode.Create, FileAccess.Write, FileShare.None))
-                    {
-                        sftp.DownloadFile(source, output, null);
-                    }
+                    RemoteFileWriter.EnsureDirectory(
+                        sftp, RemoteFileWriter.GetParentDirectory(destination));
+                    CopyFile(sftp, source, destination);
                 }
 
                 AuditLogger.Info($"复制路径 [{profile.Name}] {source} -> {destination}");
@@ -407,29 +471,43 @@ public sealed class FileWriteTools
             Name = "remote_chmod",
             Description = "修改远程文件或目录的权限位，使用八进制表示，如 644。",
             InputSchema = schema,
+            Annotations = ToolAnnotations.Modifying,
             Handler = context =>
             {
                 var profile = _service.ResolveHost(context.GetString("host"));
                 var path = context.RequireString("path");
                 var permissionsText = context.RequireString("permissions");
 
-                _service.EnsurePathAllowed(profile, path);
-
                 if (!TryParseOctalPermissions(permissionsText, out var permissions))
                 {
                     return ToolResult.Error($"权限值 '{permissionsText}' 不是合法的八进制权限，示例：644、755");
                 }
 
-                using var sftp = _service.OpenSftp(profile);
+                // 1.1 白名单先于连接校验，越界路径不触发任何远程调用
+                _service.EnsurePathAllowed(profile, path);
+
+                using var lease = _service.OpenSftp(profile);
+                var sftp = lease.Client;
+                _service.EnsureNotSymbolicLink(profile, sftp, path);
 
                 if (!sftp.Exists(path))
                 {
                     return ToolResult.Error($"路径 {path} 不存在");
                 }
 
-                sftp.ChangePermissions(path, permissions);
-                AuditLogger.Info($"修改权限 [{profile.Name}] {path} -> {permissions:o}");
-                return ToolResult.Ok($"已将 {path}（主机 {profile.Name}）权限修改为 {permissions:o}");
+                // SFTP 的权限写入在部分服务端实现上会落成错误的模式（实测请求 600 得到 404），
+                // 改用服务端自带的 chmod，结果与手工执行完全一致
+                var octalDisplay = Convert.ToString(permissions, 8).PadLeft(3, '0');
+                var output = _service.ExecuteCommand(
+                    profile, $"chmod {octalDisplay} {ShellQuote(path)}", null);
+                if (output.ExitCode != 0)
+                {
+                    return ToolResult.Error(
+                        $"修改权限失败（退出码 {output.ExitCode}）：{output.StandardError.Trim()}");
+                }
+
+                AuditLogger.Info($"修改权限 [{profile.Name}] {path} -> {octalDisplay}");
+                return ToolResult.Ok($"已将 {path}（主机 {profile.Name}）权限修改为 {octalDisplay}");
             }
         };
     }
@@ -451,18 +529,22 @@ public sealed class FileWriteTools
         return new ToolDefinition
         {
             Name = "remote_symlink",
-            Description = "在远程主机上创建符号链接（软链接）。",
+            Description = "在远程主机上创建符号链接（软链接）。target 与 linkPath 都必须落在白名单范围内。",
             InputSchema = schema,
+            Annotations = ToolAnnotations.Modifying,
             Handler = context =>
             {
                 var profile = _service.ResolveHost(context.GetString("host"));
                 var target = context.RequireString("target");
                 var linkPath = context.RequireString("linkPath");
 
+                // 1.1 链接目标同样要校验，否则可以绕过白名单把外部路径挂进来
                 _service.EnsurePathAllowed(profile, target);
                 _service.EnsurePathAllowed(profile, linkPath);
 
-                using var sftp = _service.OpenSftp(profile);
+                using var lease = _service.OpenSftp(profile);
+                var sftp = lease.Client;
+                _service.EnsureNotSymbolicLink(profile, sftp, linkPath);
 
                 if (sftp.Exists(linkPath))
                 {
@@ -480,23 +562,52 @@ public sealed class FileWriteTools
     }
 
     /// <summary>
-    /// 递归复制目录
+    /// 在远程主机内复制单个文件，读写都走同一个 SFTP 会话
     /// </summary>
-    private static void CopyDirectory(SftpClient sftp, string source, string destination)
+    private static void CopyFile(SftpClient sftp, string source, string destination)
     {
+        using var input = sftp.OpenRead(source);
+        using var output = sftp.OpenWrite(destination);
+        input.CopyTo(output, 64 * 1024);
+    }
+
+    /// <summary>
+    /// 递归复制目录，全程远程读写
+    /// </summary>
+    private static void CopyDirectory(SftpClient sftp, string source, string destination, int depth)
+    {
+        if (depth > MaxRecursionDepth)
+        {
+            throw new InvalidOperationException(
+                $"复制目录层级超过 {MaxRecursionDepth}，已中止，请检查是否存在异常的深目录结构");
+        }
+
         RemoteFileWriter.EnsureDirectory(sftp, destination);
 
-        foreach (var entry in sftp.ListDirectory(source))
+        // 同样先取快照，避免流式枚举过程中目标目录的写入干扰
+        foreach (var entry in sftp.ListDirectory(source).ToList())
         {
+            if (entry.Name is "." or "..")
+            {
+                continue;
+            }
+
             var target = PathGuard.Combine(destination, entry.Name);
+
+            // 软链接只复制链接本身，不跟进目标，避免复制到白名单外或成环
+            if (entry.IsSymbolicLink)
+            {
+                sftp.SymbolicLink(entry.FullName, target);
+                continue;
+            }
+
             if (entry.IsDirectory)
             {
-                CopyDirectory(sftp, entry.FullName, target);
+                CopyDirectory(sftp, entry.FullName, target, depth + 1);
             }
             else if (entry.IsRegularFile)
             {
-                using var output = File.Open(target, FileMode.Create, FileAccess.Write, FileShare.None);
-                sftp.DownloadFile(entry.FullName, output, null);
+                CopyFile(sftp, entry.FullName, target);
             }
         }
     }
@@ -528,36 +639,34 @@ public sealed class FileWriteTools
     }
 
     /// <summary>
-    /// 递归删除目录
+    /// 执行服务端命令，非零退出码直接抛出，避免「命令失败但工具报成功」
     /// </summary>
-    private static void DeleteDirectoryRecursive(SftpClient sftp, string directory)
+    private void RunCommandOrThrow(HostProfile profile, string command)
     {
-        foreach (var entry in sftp.ListDirectory(directory))
+        var output = _service.ExecuteCommand(profile, command, null);
+        if (output.ExitCode != 0)
         {
-            if (entry.Name is "." or "..")
-            {
-                continue;
-            }
-            if (entry.IsDirectory)
-            {
-                DeleteDirectoryRecursive(sftp, entry.FullName);
-            }
-            else
-            {
-                sftp.DeleteFile(entry.FullName);
-            }
+            throw new InvalidOperationException(
+                $"执行 {command} 失败（退出码 {output.ExitCode}）：{output.StandardError.Trim()}");
         }
-        sftp.DeleteDirectory(directory);
+    }
+
+    /// <summary>
+    /// 用单引号包裹 shell 参数，内部单引号按 POSIX 规则转义
+    /// </summary>
+    private static string ShellQuote(string value)
+    {
+        return "'" + value.Replace("'", "'\\''") + "'";
     }
 
     /// <summary>
     /// 统计文本出现次数
     /// </summary>
-    private static int CountOccurrences(string text, string pattern, StringComparison comparison)
+    private static int CountOccurrences(string text, string pattern)
     {
         var count = 0;
         var index = 0;
-        while ((index = text.IndexOf(pattern, index, comparison)) >= 0)
+        while ((index = text.IndexOf(pattern, index, StringComparison.Ordinal)) >= 0)
         {
             count++;
             index += Math.Max(pattern.Length, 1);

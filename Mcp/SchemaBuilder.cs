@@ -35,7 +35,7 @@ public static class SchemaBuilder
             root["required"] = new JsonArray(requiredList.Select(name => (JsonNode)name!).ToArray());
         }
 
-        return JsonSerializer.Deserialize<JsonElement>(root.ToJsonString());
+        return JsonSerializer.SerializeToElement(root);
     }
 
     /// <summary>字符串类型 Schema</summary>
@@ -50,7 +50,7 @@ public static class SchemaBuilder
         {
             node["default"] = defaultValue;
         }
-        return JsonSerializer.Deserialize<JsonElement>(node.ToJsonString());
+        return JsonSerializer.SerializeToElement(node);
     }
 
     /// <summary>整数类型 Schema</summary>
@@ -69,7 +69,7 @@ public static class SchemaBuilder
         {
             node["maximum"] = maximum;
         }
-        return JsonSerializer.Deserialize<JsonElement>(node.ToJsonString());
+        return JsonSerializer.SerializeToElement(node);
     }
 
     /// <summary>布尔类型 Schema</summary>
@@ -81,7 +81,7 @@ public static class SchemaBuilder
             ["description"] = description,
             ["default"] = defaultValue
         };
-        return JsonSerializer.Deserialize<JsonElement>(node.ToJsonString());
+        return JsonSerializer.SerializeToElement(node);
     }
 
     /// <summary>字符串数组 Schema</summary>
@@ -93,6 +93,6 @@ public static class SchemaBuilder
             ["description"] = description,
             ["items"] = new JsonObject { ["type"] = "string" }
         };
-        return JsonSerializer.Deserialize<JsonElement>(node.ToJsonString());
+        return JsonSerializer.SerializeToElement(node);
     }
 }

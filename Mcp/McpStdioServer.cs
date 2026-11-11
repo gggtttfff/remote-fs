@@ -12,10 +12,17 @@ public sealed class McpStdioServer
 {
     private readonly IReadOnlyList<ToolDefinition> _tools;
     private readonly JsonSerializerOptions _jsonOptions;
+    private readonly Func<string?>? _hostResolver;
+    private readonly Action<string, string?>? _onMutatingTool;
 
-    public McpStdioServer(IReadOnlyList<ToolDefinition> tools)
+    public McpStdioServer(
+        IReadOnlyList<ToolDefinition> tools,
+        Func<string?>? hostResolver = null,
+        Action<string, string?>? onMutatingTool = null)
     {
         _tools = tools;
+        _hostResolver = hostResolver;
+        _onMutatingTool = onMutatingTool;
         _jsonOptions = new JsonSerializerOptions
         {
             Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
@@ -66,6 +73,9 @@ public sealed class McpStdioServer
                 continue;
             }
 
+            // 排查握手问题时能把客户端发来的原始报文打出来
+            AuditLogger.Debug($"<- {Shorten(line)}");
+
             await HandleMessageAsync(line, writer, cancellationToken);
         }
 
@@ -77,7 +87,7 @@ public sealed class McpStdioServer
     /// </summary>
     private async Task HandleMessageAsync(string line, StreamWriter writer, CancellationToken cancellationToken)
     {
-        JsonRpcRequest? request = null;
+        JsonRpcRequest? request;
         try
         {
             request = JsonSerializer.Deserialize<JsonRpcRequest>(line, _jsonOptions);
@@ -101,7 +111,7 @@ public sealed class McpStdioServer
         var isNotification = request.Id is null;
         try
         {
-            var result = await DispatchAsync(request, cancellationToken);
+            var result = Dispatch(request);
             if (!isNotification && result is not null)
             {
                 await WriteAsync(writer, new JsonRpcResponse { Id = request.Id, Result = result }, cancellationToken);
@@ -122,9 +132,10 @@ public sealed class McpStdioServer
     }
 
     /// <summary>
-    /// 分发请求到对应处理器
+    /// 分发请求到对应处理器。
+    /// 工具处理逻辑是同步的（SFTP 连接不可并发访问），这里串行执行，不额外开线程池任务。
     /// </summary>
-    private async Task<JsonNode?> DispatchAsync(JsonRpcRequest request, CancellationToken cancellationToken)
+    private JsonNode? Dispatch(JsonRpcRequest request)
     {
         switch (request.Method)
         {
@@ -136,7 +147,7 @@ public sealed class McpStdioServer
                     {
                         ["tools"] = new JsonObject { ["listChanged"] = false }
                     },
-                    ["serverInfo"] = McpProtocol.ServerInfo
+                    ["serverInfo"] = McpProtocol.BuildServerInfo()
                 };
 
             case "notifications/initialized":
@@ -154,7 +165,7 @@ public sealed class McpStdioServer
                 };
 
             case "tools/call":
-                return await CallToolAsync(request.Params, cancellationToken);
+                return CallTool(request.Params);
 
             default:
                 if (request.Id is null)
@@ -169,7 +180,7 @@ public sealed class McpStdioServer
     /// <summary>
     /// 执行工具调用
     /// </summary>
-    private async Task<JsonNode> CallToolAsync(JsonNode? parameters, CancellationToken cancellationToken)
+    private JsonNode CallTool(JsonNode? parameters)
     {
         if (parameters is null)
         {
@@ -191,16 +202,48 @@ public sealed class McpStdioServer
         var arguments = parameters["arguments"] as JsonObject ?? new JsonObject();
         var context = new ToolCallContext(arguments);
 
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
         ToolResult result;
+        string? errorDetail = null;
         try
         {
-            result = await Task.Run(() => tool.Handler(context), cancellationToken);
+            result = tool.Handler(context);
+            if (result.IsError)
+            {
+                errorDetail = result.Text;
+            }
         }
         catch (Exception exception)
         {
             // 异常统一转成错误结果，让模型能读到原因并自行纠正
             AuditLogger.Error($"工具 {toolName} 执行失败: {exception}");
+            errorDetail = exception.ToString();
             result = ToolResult.Error($"工具 {toolName} 执行失败: {exception.Message}");
+        }
+        stopwatch.Stop();
+
+        // 1. 记录本次调用的完整出入参与耗时，是排查问题的主要依据
+        var hostName = ResolveHostName(arguments);
+        AuditLogger.ToolCall(
+            toolName,
+            hostName,
+            arguments.ToJsonString(),
+            result.Text,
+            stopwatch.ElapsedMilliseconds,
+            !result.IsError,
+            errorDetail);
+
+        // 2. 非只读工具可能改动远程内容，让它的目录缓存失效
+        if (tool.Annotations?.ReadOnlyHint != true && hostName is not null)
+        {
+            try
+            {
+                _onMutatingTool?.Invoke(toolName, hostName);
+            }
+            catch (Exception exception)
+            {
+                AuditLogger.Warn($"失效缓存失败: {exception.Message}");
+            }
         }
 
         return new JsonObject
@@ -215,16 +258,63 @@ public sealed class McpStdioServer
     }
 
     /// <summary>
+    /// 取出入参里的主机别名，用于日志归类。
+    /// 未显式传 host 时回落到默认主机，避免日志里主机一栏是空的。
+    /// </summary>
+    private string? ResolveHostName(JsonObject arguments)
+    {
+        if (arguments.TryGetPropertyValue("host", out var node) && node is not null)
+        {
+            try
+            {
+                var explicitHost = node.GetValue<string>();
+                if (!string.IsNullOrWhiteSpace(explicitHost))
+                {
+                    return explicitHost;
+                }
+            }
+            catch (Exception)
+            {
+                // 解析失败按未指定处理
+            }
+        }
+
+        try
+        {
+            return _hostResolver?.Invoke();
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
     /// 工具定义转 JSON
     /// </summary>
     private JsonObject ToJson(ToolDefinition tool)
     {
-        return new JsonObject
+        var node = new JsonObject
         {
             ["name"] = tool.Name,
             ["description"] = tool.Description,
-            ["inputSchema"] = JsonNode.Parse(tool.InputSchema.GetRawText())
+            ["inputSchema"] = JsonSerializer.SerializeToNode(tool.InputSchema)
         };
+
+        if (tool.Annotations is not null)
+        {
+            node["annotations"] = JsonSerializer.SerializeToNode(tool.Annotations, _jsonOptions);
+        }
+
+        return node;
+    }
+
+    /// <summary>
+    /// 截断过长的报文，避免日志被整包内容撑爆
+    /// </summary>
+    private static string Shorten(string text)
+    {
+        return text.Length <= 300 ? text : text[..300] + $"...(共 {text.Length} 字符)";
     }
 
     /// <summary>
@@ -233,6 +323,7 @@ public sealed class McpStdioServer
     private async Task WriteAsync(StreamWriter writer, JsonRpcResponse response, CancellationToken cancellationToken)
     {
         var json = JsonSerializer.Serialize(response, _jsonOptions);
+        AuditLogger.Debug($"-> {Shorten(json)}");
         await writer.WriteLineAsync(json.AsMemory(), cancellationToken);
         await writer.FlushAsync(cancellationToken);
     }

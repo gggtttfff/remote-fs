@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using RemoteFs.Common;
 using RemoteFs.Config;
 
@@ -8,6 +9,14 @@ namespace RemoteFs.Ssh;
 /// </summary>
 public sealed class PathGuard
 {
+    /// <summary>命令中的绝对路径引用</summary>
+    private static readonly Regex AbsolutePathPattern =
+        new(@"(?<![\w/.\-])(/[\w./\-*?~$]+)", RegexOptions.Compiled);
+
+    /// <summary>命令中的相对上级目录跳转，无法确定基准目录，一律拒绝</summary>
+    private static readonly Regex ParentTraversalPattern =
+        new(@"(^|[\s=;|&(""'<>])\.\.(/|\s|$)", RegexOptions.Compiled);
+
     private readonly AppConfig _config;
 
     public PathGuard(AppConfig config)
@@ -36,44 +45,44 @@ public sealed class PathGuard
             return;
         }
 
-        foreach (var root in profile.AllowedRoots)
+        if (!IsUnderAnyRoot(profile, normalized))
         {
-            var normalizedRoot = Normalize(root);
-            if (normalized == normalizedRoot
-                || normalized.StartsWith(normalizedRoot + "/", StringComparison.Ordinal))
-            {
-                return;
-            }
+            throw new UnauthorizedAccessException(
+                $"路径 {normalized} 不在主机 {profile.Name} 的允许范围内。允许的根目录: {string.Join(", ", profile.AllowedRoots)}");
         }
-
-        throw new UnauthorizedAccessException(
-            $"路径 {normalized} 不在主机 {profile.Name} 的允许范围内。允许的根目录: {string.Join(", ", profile.AllowedRoots)}");
     }
 
     /// <summary>
     /// 校验远程命令中引用的路径是否在允许范围内。
-    /// 命令执行本身无法完全约束行为，但至少拦住显式引用越界路径的情况，
-    /// 避免用 remote_exec 绕过文件工具的路径白名单。
+    /// 只能拦住显式写出绝对路径的写法，变量拼接、命令替换、编码解码都绕得过去，
+    /// 需要严格隔离时应把 remoteExecPolicy 设为 Deny。
     /// </summary>
     public void EnsureCommandAllowed(HostProfile profile, string command)
     {
-        if (profile.AllowedRoots.Count == 0)
+        if (_config.RemoteExecPolicy == RemoteExecPolicy.Deny)
+        {
+            throw new UnauthorizedAccessException(
+                "全局配置 remoteExecPolicy 为 Deny，远程命令执行已被禁用。");
+        }
+
+        if (_config.RemoteExecPolicy == RemoteExecPolicy.Allow || profile.AllowedRoots.Count == 0)
         {
             return;
         }
 
-        var referencedPaths = ExtractPaths(command);
-        foreach (var referencedPath in referencedPaths)
+        // 1.1 相对上级目录无法确定基准，直接拒绝
+        if (ParentTraversalPattern.IsMatch(command))
         {
-            var normalized = Normalize(referencedPath);
-            var allowed = profile.AllowedRoots.Any(root =>
-            {
-                var normalizedRoot = Normalize(root);
-                return normalized == normalizedRoot
-                    || normalized.StartsWith(normalizedRoot + "/", StringComparison.Ordinal);
-            });
+            throw new UnauthorizedAccessException(
+                $"命令中包含相对上级目录引用（..），无法判断实际访问位置，已拒绝。主机 {profile.Name} 的允许根目录: "
+                + string.Join(", ", profile.AllowedRoots));
+        }
 
-            if (!allowed)
+        // 1.2 逐个校验显式引用的绝对路径
+        foreach (Match match in AbsolutePathPattern.Matches(command))
+        {
+            var normalized = Normalize(match.Value);
+            if (!IsUnderAnyRoot(profile, normalized))
             {
                 throw new UnauthorizedAccessException(
                     $"命令引用了允许范围之外的路径 {normalized}。"
@@ -83,16 +92,26 @@ public sealed class PathGuard
     }
 
     /// <summary>
-    /// 从命令中提取形如 /path 的绝对路径引用
+    /// 判断规范化后的路径是否落在任一允许根目录下
     /// </summary>
-    private static IEnumerable<string> ExtractPaths(string command)
+    private static bool IsUnderAnyRoot(HostProfile profile, string normalizedPath)
     {
-        var matches = System.Text.RegularExpressions.Regex.Matches(
-            command, @"(?<![\w/.-])(/[\w./\-*]+)");
-        foreach (System.Text.RegularExpressions.Match item in matches)
+        return profile.AllowedRoots.Any(root =>
         {
-            yield return item.Value;
-        }
+            var normalizedRoot = Normalize(root);
+            return normalizedPath == normalizedRoot
+                || normalizedPath.StartsWith(normalizedRoot + "/", StringComparison.Ordinal);
+        });
+    }
+
+    /// <summary>
+    /// 构造符号链接拒绝提示，供白名单模式下的软链接拦截复用
+    /// </summary>
+    public static UnauthorizedAccessException BuildSymbolicLinkRejection(HostProfile profile, string path)
+    {
+        return new UnauthorizedAccessException(
+            $"路径 {path} 是符号链接。白名单模式下为防止借道软链接访问范围外内容，已拒绝该操作。"
+            + $"请直接使用链接指向的真实路径，或在 {profile.Name} 的配置里开启 followSymbolicLinks。");
     }
 
     /// <summary>

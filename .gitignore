@@ -10,6 +10,9 @@ publish/
 artifacts/
 dist/
 
+# 临时验证目录
+out-gui-check/
+
 # IDE
 .idea/
 .vscode/

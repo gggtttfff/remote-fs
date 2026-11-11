@@ -1,6 +1,7 @@
 using System.Text.Json;
 using RemoteFs.Common;
 using RemoteFs.Config;
+using RemoteFs.Logging;
 using RemoteFs.Mcp;
 using RemoteFs.Services;
 using RemoteFs.Tools;
@@ -28,8 +29,8 @@ public static class Program
         {
             if (args.Length == 0)
             {
-                PrintUsage();
-                return 1;
+                // 双击 exe 时直接打开配置界面；没有图形界面的平台仍打印用法
+                return OpenGuiOrPrintUsage();
             }
 
             var command = args[0].ToLowerInvariant();
@@ -43,13 +44,16 @@ public static class Program
                 case "hosts":
                     return HostsCommand.Execute(rest);
 
+                case "gui":
+                    return RunGui();
+
                 case "config":
                     return ConfigCommand.Execute(rest);
 
                 case "version":
                 case "--version":
                 case "-v":
-                    Console.WriteLine("remote-fs 1.0.0");
+                    Console.WriteLine($"remote-fs {McpProtocol.ServerVersion}");
                     return 0;
 
                 case "help":
@@ -79,19 +83,14 @@ public static class Program
         var configStore = new ConfigStore();
         var config = configStore.LoadConfig();
 
-        // 日志文件路径，失败时降级为仅 stderr 输出
-        var logDirectory = ConfigStore.ConfigDirectory;
-        try
-        {
-            Directory.CreateDirectory(logDirectory);
-            AuditLogger.LogFilePath = Path.Combine(logDirectory, "remote-fs.log");
-        }
-        catch (Exception exception)
-        {
-            AuditLogger.Warn($"无法创建日志目录，仅输出到 stderr: {exception.Message}");
-        }
+        // 日志开关与落盘位置都取决于全局配置
+        AuditLogger.Enabled = config.AuditLogEnabled;
+        ConfigureAuditLog(config);
 
-        var service = new RemoteFsService(config, configStore);
+        // 日志就绪后再准备配置目录，这样旧配置迁移的记录能落进日志文件
+        ConfigStore.EnsureInitialized();
+
+        using var service = new RemoteFsService(config, configStore);
 
         var tools = new List<ToolDefinition>();
         tools.AddRange(new FileReadTools(service).Build());
@@ -108,9 +107,75 @@ public static class Program
             cancellation.Cancel();
         };
 
-        var server = new McpStdioServer(tools);
+        // 主机解析器只用于日志归类，日志记不住时也不该影响正常调用
+        var server = new McpStdioServer(
+            tools,
+            () =>
+            {
+                try
+                {
+                    return service.ResolveHost(null).Name;
+                }
+                catch (Exception)
+                {
+                    return null;
+                }
+            },
+            (toolName, hostName) =>
+            {
+                if (hostName is not null)
+                {
+                    service.Cache.InvalidateHost(hostName);
+                }
+            });
         await server.RunAsync(cancellation.Token);
+
+        // 退出前把攒着的日志落盘
+        AuditLogger.Flush();
         return 0;
+    }
+
+    /// <summary>
+    /// 无参数启动：Windows 版打开图形配置界面，其他平台没有界面则打印用法
+    /// </summary>
+    private static int OpenGuiOrPrintUsage()
+    {
+#if WINDOWS_GUI
+        return RunGui();
+#else
+        PrintUsage();
+        return 1;
+#endif
+    }
+
+    /// <summary>
+    /// 启动图形配置界面，仅 Windows 版本可用
+    /// </summary>
+    private static int RunGui()
+    {
+#if WINDOWS_GUI
+        // 界面进程从资源管理器启动时看不到控制台，日志必须落到文件才能排查
+        var configStore = new ConfigStore();
+        var config = configStore.LoadConfig();
+        AuditLogger.Enabled = config.AuditLogEnabled;
+        ConfigureAuditLog(config);
+        ConfigStore.EnsureInitialized();
+        // 仅 Windows 目标会编译 Gui 目录，此处用全限定名避免引入不存在的 using
+        var exitCode = RemoteFs.Gui.GuiLauncher.Run();
+        AuditLogger.Flush();
+        return exitCode;
+#else
+        Console.Error.WriteLine("图形界面仅在 Windows 版本中提供，当前平台请使用 hosts 子命令。");
+        return 1;
+#endif
+    }
+
+    /// <summary>
+    /// 初始化日志：写到 exe 同级的 log 目录，目录不可写时降级为仅 stderr
+    /// </summary>
+    private static void ConfigureAuditLog(AppConfig config)
+    {
+        AuditLogger.Initialize(LogSettings.FromConfig(config));
     }
 
     /// <summary>
@@ -122,11 +187,14 @@ public static class Program
             remote-fs - 远程服务器文件管理 MCP 服务
 
             用法:
+              remote-fs                          打开图形配置界面（仅 Windows，等同于 gui）
               remote-fs serve                    启动 MCP stdio 服务（供 Claude Code 等客户端连接）
+              remote-fs gui                      打开主机配置图形界面（仅 Windows）
               remote-fs hosts list               列出已配置主机
               remote-fs hosts add <别名>         交互式添加主机配置
               remote-fs hosts remove <别名>      删除主机配置
               remote-fs hosts fingerprint <别名>  查看主机密钥指纹
+              remote-fs hosts import [别名...]  从 ~/.ssh/config 导入主机
               remote-fs config show              查看当前全局配置
               remote-fs version                  显示版本号
 

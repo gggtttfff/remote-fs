@@ -65,9 +65,37 @@ public static class RemoteFileReader
     }
 
     /// <summary>
+    /// 逐行读取，用于搜索等场景，避免整份文件读进内存。
+    /// 返回行号与行内容，达到字节或行数上限即停止。
+    /// </summary>
+    public static IEnumerable<(int Number, string Content)> ReadLines(
+        SftpClient sftp, string remotePath, long maxBytes, int maxLines)
+    {
+        using var stream = sftp.OpenRead(remotePath);
+        // 宽松解码：搜索场景下宁可多几个替换字符，也不要整份文件被跳过
+        using var reader = new StreamReader(
+            stream, new UTF8Encoding(false, throwOnInvalidBytes: false),
+            detectEncodingFromByteOrderMarks: true, bufferSize: 16 * 1024);
+
+        var lineNumber = 0;
+        var consumedBytes = 0L;
+        string? line;
+        while (lineNumber < maxLines
+               && consumedBytes < maxBytes
+               && (line = reader.ReadLine()) is not null)
+        {
+            lineNumber++;
+            consumedBytes += Encoding.UTF8.GetByteCount(line) + 1;
+            yield return (lineNumber, line);
+        }
+    }
+
+    /// <summary>
     /// 解码字节为文本。二进制内容（含 NUL 或非法 UTF-8）返回 null，提示改用下载。
     /// </summary>
-    public static string? TryDecodeText(byte[] content)
+    /// <param name="content">待解码内容</param>
+    /// <param name="truncated">内容是否按字节截断。截断时改用宽松解码，避免切在多字节字符中间被误判为二进制</param>
+    public static string? TryDecodeText(byte[] content, bool truncated = false)
     {
         if (content.Length == 0)
         {
@@ -80,6 +108,13 @@ public static class RemoteFileReader
             {
                 return null;
             }
+        }
+
+        if (truncated)
+        {
+            var lenient = new UTF8Encoding(false, throwOnInvalidBytes: false).GetString(content);
+            // 去掉截断点产生的替换字符，避免在输出里留一个乱码方块
+            return lenient.TrimEnd('�');
         }
 
         try

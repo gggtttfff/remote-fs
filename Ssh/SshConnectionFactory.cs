@@ -37,7 +37,7 @@ public sealed class SshConnectionFactory
             throw BuildConnectionFailure(profile, capture, exception);
         }
 
-        fingerprint = capture.Fingerprint ?? "未知";
+        fingerprint = FormatFingerprint(capture.Fingerprint);
         AuditLogger.Info($"已连接 {profile.Name} ({profile.Username}@{profile.Host}:{profile.Port}) 指纹 {fingerprint}");
         return client;
     }
@@ -48,6 +48,7 @@ public sealed class SshConnectionFactory
     public SftpClient CreateSftpClient(HostProfile profile)
     {
         var client = new SftpClient(BuildConnectionInfo(profile));
+        client.OperationTimeout = TimeSpan.FromMilliseconds(_config.SftpOperationTimeoutMilliseconds);
         var capture = new HostKeyCapture();
         AttachHostKeyCheck(profile, client, capture);
 
@@ -95,14 +96,14 @@ public sealed class SshConnectionFactory
         var connectionInfo = new ConnectionInfo(
             profile.Host, profile.Port, profile.Username, authenticationMethods.ToArray())
         {
-            Timeout = TimeSpan.FromSeconds(30)
+            Timeout = TimeSpan.FromMilliseconds(_config.ConnectionTimeoutMilliseconds)
         };
 
         return connectionInfo;
     }
 
     /// <summary>
-    /// 挂载主机密钥校验：指纹不匹配时置 CanTrust=false，握手阶段即拒绝
+    /// 挂载主机密钥校验：指纹不匹配或未固化指纹时置 CanTrust=false，握手阶段即拒绝
     /// </summary>
     private static void AttachHostKeyCheck(HostProfile profile, BaseClient client, HostKeyCapture capture)
     {
@@ -110,17 +111,34 @@ public sealed class SshConnectionFactory
         {
             capture.Fingerprint = eventArgs.FingerPrintSHA256;
 
-            // 未配置期望指纹时按首次连接记录（TOFU），交由用户后续固化
+            // 1.1 未配置期望指纹
             if (string.IsNullOrWhiteSpace(profile.KnownHostKeyFingerprint))
             {
+                if (profile.StrictHostKeyChecking)
+                {
+                    // 开了强校验却没固化指纹，拒绝放行，避免出现「以为校验了其实没有」
+                    capture.RejectionReason = "missing-fingerprint";
+                    eventArgs.CanTrust = false;
+                    return;
+                }
+
+                // 关闭强校验时按首次连接信任（TOFU），仅供内网或临时排障使用
+                AuditLogger.Warn(
+                    $"主机 {profile.Name} 未启用指纹校验，已按首次连接信任实际指纹 {eventArgs.FingerPrintSHA256}");
                 eventArgs.CanTrust = true;
                 return;
             }
 
-            eventArgs.CanTrust = string.Equals(
-                profile.KnownHostKeyFingerprint.Trim(),
-                eventArgs.FingerPrintSHA256,
-                StringComparison.OrdinalIgnoreCase);
+            // 1.2 比对已固化的指纹（两种写法都兼容：带 SHA256: 前缀或不带）
+            var matched = string.Equals(
+                NormalizeFingerprint(profile.KnownHostKeyFingerprint),
+                NormalizeFingerprint(eventArgs.FingerPrintSHA256),
+                StringComparison.Ordinal);
+            if (!matched)
+            {
+                capture.RejectionReason = "fingerprint-mismatch";
+            }
+            eventArgs.CanTrust = matched;
         };
     }
 
@@ -130,14 +148,23 @@ public sealed class SshConnectionFactory
     private static Exception BuildConnectionFailure(
         HostProfile profile, HostKeyCapture capture, Exception inner)
     {
-        var actual = capture.Fingerprint;
-        if (!string.IsNullOrWhiteSpace(actual)
-            && !string.IsNullOrWhiteSpace(profile.KnownHostKeyFingerprint)
-            && !string.Equals(profile.KnownHostKeyFingerprint.Trim(), actual, StringComparison.OrdinalIgnoreCase))
+        var actual = FormatFingerprint(capture.Fingerprint);
+
+        // 1.1 开了强校验但还没固化指纹
+        if (capture.RejectionReason == "missing-fingerprint")
+        {
+            return new InvalidOperationException(
+                $"主机 {profile.Name} 启用了 strictHostKeyChecking，但未配置 knownHostKeyFingerprint。"
+                + $"请执行 remote-fs hosts fingerprint {profile.Name} 取到指纹（本次握手实际指纹 {actual}）"
+                + "填入配置后重试，或把该主机的 strictHostKeyChecking 设为 false。", inner);
+        }
+
+        // 1.2 指纹与固化值不一致
+        if (capture.RejectionReason == "fingerprint-mismatch")
         {
             return new InvalidOperationException(
                 $"主机 {profile.Name} 的密钥指纹不匹配。期望 {profile.KnownHostKeyFingerprint}，实际 {actual}。"
-                + "若服务器已重装，请执行 remote-fs hosts fingerprint " + profile.Name + " 更新配置。", inner);
+                + $"若服务器已重装，请执行 remote-fs hosts fingerprint {profile.Name} 更新配置。", inner);
         }
 
         return new InvalidOperationException(
@@ -174,6 +201,34 @@ public sealed class SshConnectionFactory
     }
 
     /// <summary>
+    /// 归一化指纹：SSH.NET 返回的是裸 base64，而 ssh-keygen 显示带 SHA256: 前缀，
+    /// 比较时统一去掉前缀与补位等号，两种写法都认。
+    /// </summary>
+    public static string NormalizeFingerprint(string? fingerprint)
+    {
+        if (string.IsNullOrWhiteSpace(fingerprint))
+        {
+            return string.Empty;
+        }
+
+        var value = fingerprint.Trim();
+        if (value.StartsWith("SHA256:", StringComparison.OrdinalIgnoreCase))
+        {
+            value = value["SHA256:".Length..];
+        }
+        return value.TrimEnd('=').Trim();
+    }
+
+    /// <summary>
+    /// 归一化并以 ssh-keygen 的格式展示，方便和服务器控制台核对
+    /// </summary>
+    public static string FormatFingerprint(string? fingerprint)
+    {
+        var normalized = NormalizeFingerprint(fingerprint);
+        return normalized.Length == 0 ? "未知" : "SHA256:" + normalized;
+    }
+
+    /// <summary>
     /// 展开路径中的 ~ 与环境变量
     /// </summary>
     public static string ExpandHome(string path)
@@ -188,10 +243,12 @@ public sealed class SshConnectionFactory
     }
 
     /// <summary>
-    /// 握手期间捕获的主机密钥指纹
+    /// 握手期间捕获的主机密钥指纹与拒绝原因
     /// </summary>
     private sealed class HostKeyCapture
     {
         public string? Fingerprint { get; set; }
+
+        public string? RejectionReason { get; set; }
     }
 }

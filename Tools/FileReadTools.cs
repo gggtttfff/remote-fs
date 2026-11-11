@@ -1,10 +1,13 @@
 using System.Text;
 using System.Text.Json;
+using RemoteFs.Cache;
 using RemoteFs.Common;
+using RemoteFs.Config;
 using RemoteFs.Mcp;
 using RemoteFs.Services;
 using RemoteFs.Ssh;
 using Renci.SshNet;
+using Renci.SshNet.Common;
 using Renci.SshNet.Sftp;
 
 namespace RemoteFs.Tools;
@@ -56,23 +59,29 @@ public sealed class FileReadTools
             Description = "列出远程主机上的目录内容，返回文件名、类型、大小、修改时间和权限。"
                 + "用于查看远程服务器目录结构，替代人工 SSH 执行 ls。",
             InputSchema = schema,
+            Annotations = ToolAnnotations.ReadOnly,
             Handler = context =>
             {
                 var profile = _service.ResolveHost(context.GetString("host"));
                 var path = context.RequireString("path");
                 var showHidden = context.GetBool("showHidden");
 
+                // 1.1 白名单先于连接校验，越界路径不触发任何远程调用
                 _service.EnsurePathAllowed(profile, path);
 
-                using var sftp = _service.OpenSftp(profile);
-                var attributes = sftp.GetAttributes(path);
+                using var lease = _service.OpenSftp(profile);
+                var sftp = lease.Client;
+                _service.EnsureNotSymbolicLink(profile, sftp, path);
 
+                var attributes = sftp.GetAttributes(path);
                 if (!attributes.IsDirectory)
                 {
                     return ToolResult.Ok(DescribeFile(path, attributes));
                 }
 
-                var entries = sftp.ListDirectory(path)
+                var maxEntries = _service.Config.MaxListEntries;
+                var entries = ListDirectory(sftp, profile, path)
+                    .Where(entry => entry.Name is not ("." or ".."))
                     .Where(entry => showHidden || !entry.Name.StartsWith('.'))
                     .OrderBy(entry => entry.Name, StringComparer.Ordinal)
                     .ToList();
@@ -82,12 +91,21 @@ public sealed class FileReadTools
                     return ToolResult.Ok($"目录 {path} 为空");
                 }
 
+                // 1.2 条目过多时只渲染前 N 条，避免整目录拉进模型上下文
+                var visible = entries.Take(maxEntries).ToList();
+
                 var builder = new StringBuilder();
                 builder.AppendLine($"目录 {path}（主机 {profile.Name}）共 {entries.Count} 项：");
-                foreach (var entry in entries)
+                foreach (var entry in visible)
                 {
                     builder.AppendLine(DescribeFile(PathGuard.Combine(path, entry.Name), entry));
                 }
+                if (visible.Count < entries.Count)
+                {
+                    builder.AppendLine(
+                        $"[条目过多，仅显示前 {maxEntries} 项，还有 {entries.Count - visible.Count} 项未展示]");
+                }
+
                 return ToolResult.Ok(_service.TruncateOutput(builder.ToString()));
             }
         };
@@ -105,7 +123,7 @@ public sealed class FileReadTools
                 ("path", SchemaBuilder.String("远程文件绝对路径")),
                 ("offset", SchemaBuilder.Integer("起始字节偏移，用于分页读取大文件", 0)),
                 ("length", SchemaBuilder.Integer("读取字节数，-1 表示读取到文件末尾", -1)),
-                ("maxLines", SchemaBuilder.Integer("最多返回的行数，超出部分截断并提示继续读取的行号", 0))
+                ("maxLines", SchemaBuilder.Integer("最多返回的行数，超出部分截断并提示继续读取的位置", 0))
             },
             new[] { "path" });
 
@@ -115,6 +133,7 @@ public sealed class FileReadTools
             Description = "读取远程主机上的文件内容，返回带行号的文本。"
                 + "大文件会自动分页，通过 offset/length 继续读取。二进制文件请改用 remote_download。",
             InputSchema = schema,
+            Annotations = ToolAnnotations.ReadOnly,
             Handler = context =>
             {
                 var profile = _service.ResolveHost(context.GetString("host"));
@@ -123,9 +142,12 @@ public sealed class FileReadTools
                 var length = context.GetLong("length") ?? -1;
                 var maxLines = context.GetInt("maxLines") ?? 0;
 
+                // 1.1 白名单先于连接校验，越界路径不触发任何远程调用
                 _service.EnsurePathAllowed(profile, path);
 
-                using var sftp = _service.OpenSftp(profile);
+                using var lease = _service.OpenSftp(profile);
+                var sftp = lease.Client;
+                _service.EnsureNotSymbolicLink(profile, sftp, path);
 
                 var (content, totalLength, truncated) = RemoteFileReader.Read(
                     sftp, path, offset, length, _service.Config.MaxReadBytes);
@@ -135,7 +157,7 @@ public sealed class FileReadTools
                     return ToolResult.Ok($"文件 {path} 为空");
                 }
 
-                var text = RemoteFileReader.TryDecodeText(content);
+                var text = RemoteFileReader.TryDecodeText(content, truncated);
                 if (text is null)
                 {
                     return ToolResult.Error(
@@ -159,13 +181,16 @@ public sealed class FileReadTools
 
                 if (lineLimit < lines.Length)
                 {
-                    builder.AppendLine($"[内容截断，已返回前 {lineLimit} 行，共 {lines.Length} 行]");
+                    builder.AppendLine(
+                        $"[内容截断，已返回本段的前 {lineLimit} 行，本段共 {lines.Length} 行，"
+                        + $"可先放大 maxLines 或调整 offset 继续读取]");
                 }
                 if (truncated)
                 {
+                    var nextOffset = offset + content.Length;
                     builder.AppendLine(
-                        $"[文件未读完，已读取至偏移 {offset + content.Length} 字节，" +
-                        $"请用 offset={offset + content.Length} 继续读取]");
+                        $"[文件未读完，已读取至偏移 {nextOffset} 字节，"
+                        + $"请用 offset={nextOffset} 继续读取]");
                 }
 
                 return ToolResult.Ok(_service.TruncateOutput(builder.ToString()));
@@ -191,20 +216,26 @@ public sealed class FileReadTools
             Name = "remote_stat",
             Description = "查看远程文件或目录的详细属性：类型、大小、权限、属主属组、修改时间。",
             InputSchema = schema,
+            Annotations = ToolAnnotations.ReadOnly,
             Handler = context =>
             {
                 var profile = _service.ResolveHost(context.GetString("host"));
                 var path = context.RequireString("path");
 
+                // 1.1 白名单先于连接校验，越界路径不触发任何远程调用
                 _service.EnsurePathAllowed(profile, path);
 
-                using var sftp = _service.OpenSftp(profile);
+                using var lease = _service.OpenSftp(profile);
+                var sftp = lease.Client;
+
+                // 1.2 stat 只读元数据，不拒绝软链接，但要把类型如实标出来
+                var isSymbolicLink = RemotePathInspector.IsSymbolicLink(sftp, path);
                 var attributes = sftp.GetAttributes(path);
 
                 var builder = new StringBuilder();
                 builder.AppendLine($"路径: {path}");
                 builder.AppendLine($"主机: {profile.Name}");
-                builder.AppendLine($"类型: {(attributes.IsDirectory ? "目录" : attributes.IsSymbolicLink ? "符号链接" : "文件")}");
+                builder.AppendLine($"类型: {(isSymbolicLink ? "符号链接" : attributes.IsDirectory ? "目录" : "文件")}");
                 builder.AppendLine($"大小: {attributes.Size} 字节 ({RemoteFsService.FormatSize(attributes.Size)})");
                 builder.AppendLine($"权限: {FormatPermissions(attributes)}");
                 builder.AppendLine($"属主: {attributes.UserId}");
@@ -234,7 +265,7 @@ public sealed class FileReadTools
                 ("pattern", SchemaBuilder.String("要搜索的文本内容")),
                 ("filePattern", SchemaBuilder.String("文件名过滤的通配符，如 *.conf，默认匹配所有文件")),
                 ("caseSensitive", SchemaBuilder.Boolean("是否区分大小写", false)),
-                ("maxResults", SchemaBuilder.Integer("最大返回结果条数", 50)),
+                ("maxResults", SchemaBuilder.Integer("最大返回结果条数，受全局 maxSearchResults 上限约束", 50)),
                 ("recursive", SchemaBuilder.Boolean("是否递归搜索子目录", true))
             },
             new[] { "path", "pattern" });
@@ -245,6 +276,7 @@ public sealed class FileReadTools
             Description = "在远程主机的目录中搜索包含指定文本的文件，返回匹配的文件路径与行内容。"
                 + "用于快速定位配置文件中的配置项，比逐个读取文件更高效。",
             InputSchema = schema,
+            Annotations = ToolAnnotations.ReadOnly,
             Handler = context =>
             {
                 var profile = _service.ResolveHost(context.GetString("host"));
@@ -252,12 +284,15 @@ public sealed class FileReadTools
                 var pattern = context.RequireString("pattern");
                 var filePattern = context.GetString("filePattern");
                 var caseSensitive = context.GetBool("caseSensitive");
-                var maxResults = context.GetInt("maxResults") ?? 50;
+                var maxResults = _service.ClampResultCount(context.GetInt("maxResults") ?? 50);
                 var recursive = context.GetBool("recursive", true);
 
+                // 1.1 白名单先于连接校验，越界路径不触发任何远程调用
                 _service.EnsurePathAllowed(profile, path);
 
-                using var sftp = _service.OpenSftp(profile);
+                using var lease = _service.OpenSftp(profile);
+                var sftp = lease.Client;
+                _service.EnsureNotSymbolicLink(profile, sftp, path);
 
                 var comparison = caseSensitive
                     ? StringComparison.Ordinal
@@ -266,8 +301,9 @@ public sealed class FileReadTools
                 var builder = new StringBuilder();
                 var matchCount = 0;
                 var scannedCount = 0;
+                var skippedCount = 0;
 
-                foreach (var file in EnumerateFiles(sftp, path, recursive, filePattern))
+                foreach (var file in EnumerateFiles(sftp, profile, path, recursive, filePattern))
                 {
                     scannedCount++;
                     if (matchCount >= maxResults)
@@ -277,35 +313,44 @@ public sealed class FileReadTools
 
                     try
                     {
-                        var (content, _, _) = RemoteFileReader.Read(sftp, file, 0, -1, _service.Config.MaxReadBytes);
-                        var text = RemoteFileReader.TryDecodeText(content);
-                        if (text is null)
+                        // 流式按行读取，避免整份文件进内存
+                        foreach (var (number, line) in RemoteFileReader.ReadLines(
+                                     sftp, file, _service.Config.MaxReadBytes, 200_000))
                         {
-                            continue;
-                        }
-
-                        var lines = text.Split('\n');
-                        for (var index = 0; index < lines.Length && matchCount < maxResults; index++)
-                        {
-                            if (lines[index].Contains(pattern, comparison))
+                            if (!line.Contains(pattern, comparison))
                             {
-                                builder.AppendLine($"{file}:{index + 1}: {lines[index].TrimEnd('\r').Trim()}");
-                                matchCount++;
+                                continue;
+                            }
+                            builder.AppendLine($"{file}:{number}: {line.Trim()}");
+                            matchCount++;
+                            if (matchCount >= maxResults)
+                            {
+                                break;
                             }
                         }
                     }
+                    catch (SshConnectionException)
+                    {
+                        // 连接已断，继续扫描没有意义
+                        throw;
+                    }
                     catch (Exception exception)
                     {
+                        skippedCount++;
                         AuditLogger.Warn($"搜索跳过文件 {file}: {exception.Message}");
                     }
                 }
 
                 if (matchCount == 0)
                 {
-                    return ToolResult.Ok($"在 {path} 中未找到包含 \"{pattern}\" 的内容（已扫描 {scannedCount} 个文件）");
+                    return ToolResult.Ok(
+                        $"在 {path} 中未找到包含 \"{pattern}\" 的内容（已扫描 {scannedCount} 个文件）");
                 }
 
-                builder.Insert(0, $"在 {path} 中找到 {matchCount} 处匹配（已扫描 {scannedCount} 个文件）：\n");
+                builder.Insert(0,
+                    $"在 {path} 中找到 {matchCount} 处匹配（已扫描 {scannedCount} 个文件"
+                    + (skippedCount > 0 ? $"，跳过 {skippedCount} 个无法读取的文件" : string.Empty)
+                    + "）：\n");
                 return ToolResult.Ok(_service.TruncateOutput(builder.ToString()));
             }
         };
@@ -321,7 +366,7 @@ public sealed class FileReadTools
             {
                 ("host", SchemaBuilder.String("目标主机别名，未指定则使用默认主机")),
                 ("path", SchemaBuilder.String("起始目录绝对路径")),
-                ("depth", SchemaBuilder.Integer("递归深度，默认 2", 1, 10))
+                ("depth", SchemaBuilder.Integer("递归深度，默认 2，受全局 maxTreeDepth 上限约束", 1, 10))
             },
             new[] { "path" });
 
@@ -330,22 +375,26 @@ public sealed class FileReadTools
             Name = "remote_tree",
             Description = "以树形结构展示远程目录结构，便于快速了解服务器上目录布局。",
             InputSchema = schema,
+            Annotations = ToolAnnotations.ReadOnly,
             Handler = context =>
             {
                 var profile = _service.ResolveHost(context.GetString("host"));
                 var path = context.RequireString("path");
-                var depth = context.GetInt("depth") ?? 2;
+                var depth = _service.ClampTreeDepth(context.GetInt("depth") ?? 2);
 
+                // 1.1 白名单先于连接校验，越界路径不触发任何远程调用
                 _service.EnsurePathAllowed(profile, path);
 
-                using var sftp = _service.OpenSftp(profile);
+                using var lease = _service.OpenSftp(profile);
+                var sftp = lease.Client;
+                _service.EnsureNotSymbolicLink(profile, sftp, path);
 
                 var builder = new StringBuilder();
                 builder.AppendLine($"{path}（主机 {profile.Name}）");
                 var entryCount = 0;
                 var maxEntries = _service.Config.MaxListEntries;
 
-                AppendTree(sftp, path, builder, 1, depth, ref entryCount, maxEntries);
+                AppendTree(sftp, profile, path, builder, 1, depth, ref entryCount, maxEntries);
 
                 if (entryCount >= maxEntries)
                 {
@@ -361,7 +410,7 @@ public sealed class FileReadTools
     /// 递归追加目录树
     /// </summary>
     private void AppendTree(
-        SftpClient sftp, string directory, StringBuilder builder, int level, int depth,
+        SftpClient sftp, HostProfile profile, string directory, StringBuilder builder, int level, int depth,
         ref int entryCount, int maxEntries)
     {
         if (level > depth || entryCount >= maxEntries)
@@ -369,10 +418,10 @@ public sealed class FileReadTools
             return;
         }
 
-        List<ISftpFile> entries;
+        List<Cache.CachedFileEntry> entries;
         try
         {
-            entries = sftp.ListDirectory(directory)
+            entries = ListDirectory(sftp, profile, directory)
                 .Where(entry => !entry.Name.StartsWith('.'))
                 .OrderBy(entry => entry.IsDirectory ? 0 : 1)
                 .ThenBy(entry => entry.Name, StringComparer.Ordinal)
@@ -393,10 +442,18 @@ public sealed class FileReadTools
             entryCount++;
 
             var indent = new string(' ', level * 2);
+
+            // 不跟随软链接，避免软链接成环时无限展开
+            if (entry.IsSymbolicLink)
+            {
+                builder.AppendLine($"{indent}{entry.Name}  -> [符号链接，未展开]");
+                continue;
+            }
+
             if (entry.IsDirectory)
             {
                 builder.AppendLine($"{indent}{entry.Name}/");
-                AppendTree(sftp, entry.FullName, builder, level + 1, depth, ref entryCount, maxEntries);
+                AppendTree(sftp, profile, entry.FullName, builder, level + 1, depth, ref entryCount, maxEntries);
             }
             else
             {
@@ -406,53 +463,36 @@ public sealed class FileReadTools
     }
 
     /// <summary>
-    /// 枚举目录下的文件
+    /// 列出单个目录的内容，命中缓存时直接复用上次结果。
+    /// 缓存的是完整列举，不会出现半份数据导致漏结果。
     /// </summary>
-    private IEnumerable<string> EnumerateFiles(
-        SftpClient sftp, string directory, bool recursive, string? filePattern)
+    private List<Cache.CachedFileEntry> ListDirectory(
+        SftpClient sftp, HostProfile profile, string directory)
     {
-        List<ISftpFile> entries;
-        try
+        // 1. 命中缓存直接复用
+        var cached = _service.Cache.GetListing(profile.Name, directory);
+        if (cached is not null)
         {
-            entries = sftp.ListDirectory(directory).ToList();
-        }
-        catch (Exception exception)
-        {
-            AuditLogger.Warn($"读取目录 {directory} 失败: {exception.Message}");
-            yield break;
+            return cached;
         }
 
+        // 2. 未命中就真的列举一次，并记录下来
+        var entries = sftp.ListDirectory(directory).ToList();
+        var record = new List<Cache.CachedFileEntry>();
         foreach (var entry in entries)
         {
-            if (entry.Name.StartsWith('.'))
+            record.Add(new Cache.CachedFileEntry
             {
-                continue;
-            }
-
-            if (entry.IsDirectory)
-            {
-                if (recursive)
-                {
-                    foreach (var nested in EnumerateFiles(sftp, entry.FullName, recursive, filePattern))
-                    {
-                        yield return nested;
-                    }
-                }
-                continue;
-            }
-
-            if (!entry.IsRegularFile)
-            {
-                continue;
-            }
-
-            if (!string.IsNullOrWhiteSpace(filePattern) && !MatchesPattern(entry.Name, filePattern))
-            {
-                continue;
-            }
-
-            yield return entry.FullName;
+                Name = entry.Name,
+                FullName = entry.FullName,
+                Length = entry.Length,
+                IsDirectory = entry.IsDirectory,
+                IsSymbolicLink = entry.IsSymbolicLink,
+                LastWriteTimeUtc = entry.LastWriteTimeUtc
+            });
         }
+        _service.Cache.SaveListing(profile.Name, directory, record);
+        return record;
     }
 
     /// <summary>
@@ -470,6 +510,73 @@ public sealed class FileReadTools
             .Replace("\\?", ".") + "$";
         return System.Text.RegularExpressions.Regex.IsMatch(
             name, regex, System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+    }
+
+    /// <summary>
+    /// 枚举目录下的普通文件，跳过软链接与隐藏目录
+    /// </summary>
+    private IEnumerable<string> EnumerateFiles(
+        SftpClient sftp, HostProfile profile, string directory, bool recursive, string? filePattern)
+    {
+        List<Cache.CachedFileEntry> entries;
+        try
+        {
+            entries = ListDirectory(sftp, profile, directory);
+        }
+        catch (Exception exception)
+        {
+            AuditLogger.Warn($"读取目录 {directory} 失败: {exception.Message}");
+            yield break;
+        }
+
+        foreach (var entry in entries)
+        {
+            if (entry.Name.StartsWith('.'))
+            {
+                continue;
+            }
+
+            // 软链接可能指向白名单外或形成环，遍历时直接跳过
+            if (entry.IsSymbolicLink)
+            {
+                continue;
+            }
+
+            if (entry.IsDirectory)
+            {
+                if (recursive)
+                {
+                    foreach (var nested in EnumerateFiles(sftp, profile, entry.FullName, recursive, filePattern))
+                    {
+                        yield return nested;
+                    }
+                }
+                continue;
+            }
+
+            if (entry.IsDirectory || entry.IsSymbolicLink)
+            {
+                continue;
+            }
+
+            if (!string.IsNullOrWhiteSpace(filePattern) && !MatchesPattern(entry.Name, filePattern))
+            {
+                continue;
+            }
+
+            yield return entry.FullName;
+        }
+    }
+
+    /// <summary>
+    /// 描述文件条目
+    /// </summary>
+    private static string DescribeFile(string path, Cache.CachedFileEntry file)
+    {
+        var type = file.IsDirectory ? "目录" : file.IsSymbolicLink ? "链接" : "文件";
+        var size = file.IsDirectory ? "-" : RemoteFsService.FormatSize(file.Length);
+        var modified = file.LastWriteTimeUtc.ToString("yyyy-MM-dd HH:mm:ss");
+        return $"{type,-4} {size,10}  {modified}  {path}";
     }
 
     /// <summary>

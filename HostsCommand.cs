@@ -19,6 +19,7 @@ public static class HostsCommand
         }
 
         var action = args[0].ToLowerInvariant();
+        ConfigStore.EnsureInitialized();
         var configStore = new ConfigStore();
 
         return action switch
@@ -27,8 +28,55 @@ public static class HostsCommand
             "add" => AddHost(configStore, args.Skip(1).ToArray()),
             "remove" => RemoveHost(configStore, args.Skip(1).ToArray()),
             "fingerprint" => ShowFingerprint(configStore, args.Skip(1).ToArray()),
+            "import" => ImportFromSshConfig(configStore, args.Skip(1).ToArray()),
             _ => UnknownAction(action)
         };
+    }
+
+    /// <summary>
+    /// 从 ~/.ssh/config 导入主机配置
+    /// </summary>
+    private static int ImportFromSshConfig(ConfigStore configStore, string[] args)
+    {
+        var importer = new Services.SshConfigImporter(configStore);
+        var candidates = importer.Scan();
+
+        if (candidates.Count == 0)
+        {
+            Console.WriteLine("没有找到可导入的主机。检查 ~/.ssh/config 是否存在且包含 Host 条目。");
+            return 1;
+        }
+
+        // 指定了主机名就只导入指定的，否则导入全部
+        var wanted = args.Length > 0 ? args : candidates.Select(item => item.Pattern).ToArray();
+        var selected = candidates
+            .Where(item => wanted.Contains(item.Pattern, StringComparer.OrdinalIgnoreCase))
+            .ToList();
+
+        if (selected.Count == 0)
+        {
+            Console.Error.WriteLine($"没有匹配的主机。可用: {string.Join(", ", candidates.Select(item => item.Pattern))}");
+            return 1;
+        }
+
+        foreach (var item in selected)
+        {
+            item.Selected = true;
+        }
+
+        var created = importer.Import(selected);
+        Console.WriteLine($"已导入 {created.Count} 台主机:");
+        foreach (var host in created)
+        {
+            var keyStatus = string.IsNullOrEmpty(host.PrivateKeyPath)
+                ? "无私钥"
+                : File.Exists(host.PrivateKeyPath) ? "私钥存在" : "私钥不存在";
+            Console.WriteLine($"  {host.Name}: {host.Username}@{host.Host}:{host.Port} ({keyStatus})");
+        }
+
+        Console.WriteLine();
+        Console.WriteLine("下一步: 执行 remote-fs hosts fingerprint <别名> 获取指纹并填入 hosts.json。");
+        return 0;
     }
 
     /// <summary>
@@ -196,7 +244,8 @@ public static class HostsCommand
         try
         {
             var factory = new SshConnectionFactory(configStore.LoadConfig());
-            using var client = factory.CreateSshClient(profile, out var fingerprint);
+            // 用放宽指纹校验的副本连接，否则「还没固化指纹」会让取指纹这件事本身失败
+            using var client = factory.CreateSshClient(HostKeyValidator.CreateProbeProfile(profile), out var fingerprint);
             Console.WriteLine($"主机 {name} 的密钥指纹: {fingerprint}");
             Console.WriteLine("请将其填入 hosts.json 对应主机的 knownHostKeyFingerprint 字段。");
             return 0;
@@ -214,7 +263,7 @@ public static class HostsCommand
     private static int UnknownAction(string action)
     {
         Console.Error.WriteLine($"未知操作: {action}");
-        Console.WriteLine("可用操作: list, add, remove, fingerprint");
+        Console.WriteLine("可用操作: list, add, remove, fingerprint, import");
         return 1;
     }
 

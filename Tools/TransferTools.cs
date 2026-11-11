@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using RemoteFs.Cache;
 using RemoteFs.Common;
 using RemoteFs.Mcp;
 using RemoteFs.Services;
@@ -54,6 +55,7 @@ public sealed class TransferTools
             Name = "remote_download",
             Description = "把远程文件下载到本地。适合获取二进制文件、大文件或日志备份。",
             InputSchema = schema,
+            Annotations = ToolAnnotations.Modifying,
             Handler = context =>
             {
                 var profile = _service.ResolveHost(context.GetString("host"));
@@ -61,7 +63,17 @@ public sealed class TransferTools
                 var localPath = context.RequireString("localPath");
                 var overwrite = context.GetBool("overwrite");
 
+                // 1.1 白名单先于连接校验，越界路径不触发任何远程调用
                 _service.EnsurePathAllowed(profile, remotePath);
+
+                using var lease = _service.OpenSftp(profile);
+                var sftp = lease.Client;
+                _service.EnsureNotSymbolicLink(profile, sftp, remotePath);
+
+                if (!sftp.Exists(remotePath))
+                {
+                    return ToolResult.Error($"远程文件 {remotePath} 不存在");
+                }
 
                 var targetPath = ResolveLocalPath(localPath, remotePath);
                 if (File.Exists(targetPath) && !overwrite)
@@ -76,16 +88,21 @@ public sealed class TransferTools
                     Directory.CreateDirectory(parent);
                 }
 
-                using var sftp = _service.OpenSftp(profile);
-
-                if (!sftp.Exists(remotePath))
+                // 先下到缓存临时文件，成功后再落到目标位置，中断不会在目标处留半个文件
+                var temporaryPath = _service.Cache.CreateTempFilePath();
+                try
                 {
-                    return ToolResult.Error($"远程文件 {remotePath} 不存在");
+                    using (var output = File.Open(temporaryPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                    {
+                        sftp.DownloadFile(remotePath, output, null);
+                    }
+
+                    Cache.CacheStore.MoveIntoPlace(temporaryPath, targetPath);
                 }
-
-                using (var output = File.Open(targetPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                catch
                 {
-                    sftp.DownloadFile(remotePath, output, null);
+                    Cache.CacheStore.TryDelete(temporaryPath);
+                    throw;
                 }
 
                 var size = new FileInfo(targetPath).Length;
@@ -107,7 +124,7 @@ public sealed class TransferTools
             {
                 ("host", SchemaBuilder.String("目标主机别名，未指定则使用默认主机")),
                 ("localPath", SchemaBuilder.String("本地文件路径")),
-                ("remotePath", SchemaBuilder.String("远程目标路径，目录则以原文件名保存到该目录")),
+                ("remotePath", SchemaBuilder.String("远程目标路径；以 / 结尾或指向已存在目录时，按目录处理并保留原文件名")),
                 ("overwrite", SchemaBuilder.Boolean("远程文件已存在时是否覆盖", false))
             },
             new[] { "localPath", "remotePath" });
@@ -117,6 +134,7 @@ public sealed class TransferTools
             Name = "remote_upload",
             Description = "把本地文件上传到远程主机。可用于部署配置文件、推送脚本。",
             InputSchema = schema,
+            Annotations = ToolAnnotations.Destructive,
             Handler = context =>
             {
                 var profile = _service.ResolveHost(context.GetString("host"));
@@ -130,24 +148,32 @@ public sealed class TransferTools
                     return ToolResult.Error($"本地文件 {fullLocalPath} 不存在");
                 }
 
-                using var sftp = _service.OpenSftp(profile);
+                // 1.1 白名单先于连接校验，越界路径不触发任何远程调用
+                _service.EnsurePathAllowed(profile, remotePath);
 
-                var targetPath = remotePath;
+                using var lease = _service.OpenSftp(profile);
+                var sftp = lease.Client;
+                _service.EnsureNotSymbolicLink(profile, sftp, remotePath);
+
+                // 1.2 判断目标是否按目录处理：显式以 / 结尾，或已经是目录
+                var treatAsDirectory = remotePath.EndsWith('/');
                 if (sftp.Exists(remotePath))
                 {
-                    var attributes = sftp.GetAttributes(remotePath);
-                    if (attributes.IsDirectory)
-                    {
-                        targetPath = PathGuard.Combine(remotePath, Path.GetFileName(fullLocalPath));
-                    }
+                    treatAsDirectory = sftp.GetAttributes(remotePath).IsDirectory;
                 }
-                else if (!remotePath.EndsWith('/'))
+                else if (treatAsDirectory)
                 {
-                    // 目标不存在且不是目录，按字面路径处理
-                    targetPath = remotePath;
+                    RemoteFileWriter.EnsureDirectory(sftp, remotePath);
                 }
 
+                // 2.1 目录语义下保留本地文件名
+                var targetPath = treatAsDirectory
+                    ? PathGuard.Combine(remotePath, Path.GetFileName(fullLocalPath))
+                    : remotePath;
+
                 _service.EnsurePathAllowed(profile, targetPath);
+                // 目标可能是已存在的软链接，上传会写穿到链接目标，必须拦下
+                _service.EnsureNotSymbolicLink(profile, sftp, targetPath);
 
                 if (sftp.Exists(targetPath) && !overwrite)
                 {
@@ -155,8 +181,7 @@ public sealed class TransferTools
                         $"远程文件 {targetPath} 已存在。请指定其他路径，或设置 overwrite=true。");
                 }
 
-                var parent = RemoteFileWriter.GetParentDirectory(targetPath);
-                RemoteFileWriter.EnsureDirectory(sftp, parent);
+                RemoteFileWriter.EnsureDirectory(sftp, RemoteFileWriter.GetParentDirectory(targetPath));
 
                 using (var input = File.OpenRead(fullLocalPath))
                 {
@@ -192,6 +217,7 @@ public sealed class TransferTools
             Name = "remote_download_dir",
             Description = "递归下载远程目录到本地目录。用于备份配置文件、获取整份站点配置。",
             InputSchema = schema,
+            Annotations = ToolAnnotations.Modifying,
             Handler = context =>
             {
                 var profile = _service.ResolveHost(context.GetString("host"));
@@ -199,9 +225,12 @@ public sealed class TransferTools
                 var localPath = context.RequireString("localPath");
                 var maxFiles = context.GetInt("maxFiles") ?? 500;
 
+                // 1.1 白名单先于连接校验，越界路径不触发任何远程调用
                 _service.EnsurePathAllowed(profile, remotePath);
 
-                using var sftp = _service.OpenSftp(profile);
+                using var lease = _service.OpenSftp(profile);
+                var sftp = lease.Client;
+                _service.EnsureNotSymbolicLink(profile, sftp, remotePath);
 
                 if (!sftp.Exists(remotePath))
                 {
@@ -213,18 +242,21 @@ public sealed class TransferTools
 
                 var fileCount = 0;
                 var totalSize = 0L;
-                var skipped = 0;
+                var skippedCount = 0;
+                var reachedLimit = false;
 
                 foreach (var file in EnumerateRemoteFiles(sftp, remotePath))
                 {
+                    // 1.2 达到上限直接停止遍历，不再空跑整棵目录树
                     if (fileCount >= maxFiles)
                     {
-                        skipped++;
-                        continue;
+                        reachedLimit = true;
+                        break;
                     }
 
                     var relativePath = file.FullName[remotePath.Length..].TrimStart('/');
-                    var targetFile = Path.Combine(fullLocalPath, relativePath.Replace('/', Path.DirectorySeparatorChar));
+                    var targetFile = Path.Combine(
+                        fullLocalPath, relativePath.Replace('/', Path.DirectorySeparatorChar));
                     var targetDirectory = Path.GetDirectoryName(targetFile);
                     if (!string.IsNullOrEmpty(targetDirectory))
                     {
@@ -240,17 +272,23 @@ public sealed class TransferTools
                     }
                     catch (Exception exception)
                     {
+                        skippedCount++;
                         AuditLogger.Warn($"下载跳过 {file.FullName}: {exception.Message}");
                     }
                 }
 
-                AuditLogger.Info($"下载目录 [{profile.Name}] {remotePath} -> {fullLocalPath} ({fileCount} 个文件)");
+                AuditLogger.Info(
+                    $"下载目录 [{profile.Name}] {remotePath} -> {fullLocalPath} ({fileCount} 个文件)");
 
                 var message = $"已下载 {remotePath} 到本地 {fullLocalPath}，"
                     + $"共 {fileCount} 个文件（{RemoteFsService.FormatSize(totalSize)}）";
-                if (skipped > 0)
+                if (reachedLimit)
                 {
-                    message += $"，因超过 maxFiles 上限跳过 {skipped} 个文件";
+                    message += $"，已达到 maxFiles 上限 {maxFiles}，剩余文件未下载";
+                }
+                if (skippedCount > 0)
+                {
+                    message += $"，跳过 {skippedCount} 个读取失败的文件";
                 }
                 return ToolResult.Ok(message);
             }
@@ -271,7 +309,7 @@ public sealed class TransferTools
     }
 
     /// <summary>
-    /// 递归枚举远程文件
+    /// 递归枚举远程普通文件，跳过软链接
     /// </summary>
     private static IEnumerable<ISftpFile> EnumerateRemoteFiles(SftpClient sftp, string directory)
     {
@@ -288,6 +326,17 @@ public sealed class TransferTools
 
         foreach (var entry in entries)
         {
+            if (entry.Name is "." or "..")
+            {
+                continue;
+            }
+
+            // 软链接不跟进，避免把白名单外或成环的内容一并拉下来
+            if (entry.IsSymbolicLink)
+            {
+                continue;
+            }
+
             if (entry.IsDirectory)
             {
                 foreach (var nested in EnumerateRemoteFiles(sftp, entry.FullName))

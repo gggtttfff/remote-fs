@@ -3,6 +3,7 @@ using System.Text.Json;
 using RemoteFs.Common;
 using RemoteFs.Mcp;
 using RemoteFs.Services;
+using RemoteFs.Ssh;
 
 namespace RemoteFs.Tools;
 
@@ -49,8 +50,11 @@ public sealed class CommandTools
         {
             Name = "remote_exec",
             Description = "在远程主机上执行 shell 命令并返回标准输出、标准错误和退出码。"
-                + "适用于查看日志、重启服务、检查系统状态等非纯文件操作场景。",
+                + "适用于查看日志、重启服务、检查系统状态等非纯文件操作场景。"
+                + "注意：命令中的路径防护是尽力而为，变量拼接等写法无法拦截，"
+                + "需要严格隔离时应把全局配置 remoteExecPolicy 设为 Deny。",
             InputSchema = schema,
+            Annotations = ToolAnnotations.Destructive,
             Handler = context =>
             {
                 var profile = _service.ResolveHost(context.GetString("host"));
@@ -105,14 +109,19 @@ public sealed class CommandTools
         return new ToolDefinition
         {
             Name = "remote_test_connection",
-            Description = "测试与远程主机的 SSH 连接是否正常，返回延迟、主机密钥指纹和系统信息。",
+            Description = "测试与远程主机的 SSH 连接是否正常，返回延迟、主机密钥指纹和系统信息。"
+                + "该工具不做指纹比对，可用于在固化指纹之前确认服务器实际指纹。",
             InputSchema = schema,
+            Annotations = ToolAnnotations.ReadOnly,
             Handler = context =>
             {
                 var profile = _service.ResolveHost(context.GetString("host"));
 
+                // 用放宽指纹校验的副本连接，否则「还没固化指纹」会让测试本身失败
+                var probeProfile = HostKeyValidator.CreateProbeProfile(profile);
+
                 var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-                using var client = _service.OpenSsh(profile, out var fingerprint);
+                using var client = _service.OpenSsh(probeProfile, out var fingerprint);
                 stopwatch.Stop();
 
                 var builder = new StringBuilder();
@@ -120,6 +129,24 @@ public sealed class CommandTools
                 builder.AppendLine($"握手耗时: {stopwatch.ElapsedMilliseconds} 毫秒");
                 builder.AppendLine($"服务器版本: {client.ConnectionInfo.ServerVersion}");
                 builder.AppendLine($"主机密钥指纹: {fingerprint}");
+
+                // 1.1 与已固化的指纹比对，方便发现服务器重装或中间人
+                if (string.IsNullOrWhiteSpace(profile.KnownHostKeyFingerprint))
+                {
+                    builder.AppendLine("指纹固定: 未配置 knownHostKeyFingerprint");
+                }
+                else if (string.Equals(
+                             SshConnectionFactory.NormalizeFingerprint(profile.KnownHostKeyFingerprint),
+                             SshConnectionFactory.NormalizeFingerprint(fingerprint),
+                             StringComparison.Ordinal))
+                {
+                    builder.AppendLine("指纹固定: 与配置一致");
+                }
+                else
+                {
+                    builder.AppendLine(
+                        $"指纹固定: 与配置不一致！配置为 {profile.KnownHostKeyFingerprint}，本次实际为 {fingerprint}");
+                }
 
                 return ToolResult.Ok(builder.ToString());
             }
@@ -142,6 +169,7 @@ public sealed class CommandTools
             Name = "remote_list_hosts",
             Description = "列出已配置的远程主机别名与连接信息。需要时可用于确认哪些主机可用。",
             InputSchema = schema,
+            Annotations = ToolAnnotations.ReadOnly,
             Handler = context =>
             {
                 var includeOffline = context.GetBool("includeOffline");
@@ -169,7 +197,9 @@ public sealed class CommandTools
                         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
                         try
                         {
-                            using var client = _service.OpenSsh(host, out _);
+                            // 同样放宽指纹校验，只判断网络与认证是否可用
+                            using var client = _service.OpenSsh(
+                                HostKeyValidator.CreateProbeProfile(host), out _);
                             stopwatch.Stop();
                             builder.AppendLine($"  状态: 可连接（{stopwatch.ElapsedMilliseconds} 毫秒）");
                         }

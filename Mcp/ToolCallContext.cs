@@ -1,4 +1,3 @@
-using System.Text.Json;
 using System.Text.Json.Nodes;
 using RemoteFs.Common;
 
@@ -9,14 +8,14 @@ namespace RemoteFs.Mcp;
 /// </summary>
 public sealed class ToolCallContext
 {
-    private readonly System.Text.Json.Nodes.JsonObject _arguments;
+    private readonly JsonObject _arguments;
 
     public ToolCallContext(JsonNode? arguments)
     {
-        _arguments = arguments as System.Text.Json.Nodes.JsonObject ?? new System.Text.Json.Nodes.JsonObject();
+        _arguments = arguments as JsonObject ?? new JsonObject();
     }
 
-    /// <summary>读取必填字符串参数</summary>
+    /// <summary>读取必填字符串参数，空白视为缺失</summary>
     public string RequireString(string name)
     {
         var value = GetString(name);
@@ -27,6 +26,19 @@ public sealed class ToolCallContext
         return value;
     }
 
+    /// <summary>
+    /// 读取必填文本参数，允许空字符串。
+    /// 用于写文件这类「空内容也是合法值」的场景，与 RequireString 区分开。
+    /// </summary>
+    public string RequireText(string name)
+    {
+        if (!_arguments.TryGetPropertyValue(name, out var node) || node is null)
+        {
+            throw new ArgumentException($"参数 '{name}' 为必填项");
+        }
+        return ReadStringValue(node) ?? string.Empty;
+    }
+
     /// <summary>读取可选字符串参数</summary>
     public string? GetString(string name)
     {
@@ -34,7 +46,7 @@ public sealed class ToolCallContext
         {
             return null;
         }
-        var value = node.GetValue<string>();
+        var value = ReadStringValue(node);
         return string.IsNullOrWhiteSpace(value) ? null : value;
     }
 
@@ -95,24 +107,20 @@ public sealed class ToolCallContext
         }
     }
 
-    /// <summary>读取可选字符串数组参数</summary>
-    public List<string> GetStringList(string name)
+    /// <summary>
+    /// 把节点读成字符串，非字符串类型（如数字、布尔）也能兼容转换
+    /// </summary>
+    private static string? ReadStringValue(JsonNode node)
     {
-        var result = new List<string>();
-        if (!_arguments.TryGetPropertyValue(name, out var node) || node is null)
+        // 非标量节点无法当字符串使用，按缺失处理而不是抛异常
+        if (node is not System.Text.Json.Nodes.JsonValue)
         {
-            return result;
+            return null;
         }
-        if (node is JsonArray array)
-        {
-            foreach (var item in array)
-            {
-                if (item is not null)
-                {
-                    result.Add(item.GetValue<string>());
-                }
-            }
-        }
-        return result;
+
+        var value = node.GetValue<System.Text.Json.JsonElement>();
+        return value.ValueKind == System.Text.Json.JsonValueKind.String
+            ? value.GetString()
+            : value.ToString();
     }
 }
