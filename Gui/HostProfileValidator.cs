@@ -41,6 +41,16 @@ public static class HostProfileValidator
         {
             errors.Add("命令超时不能小于 1000 毫秒");
         }
+        if (candidate.AgentPort is < 0 or > 65535)
+        {
+            errors.Add("备用端口必须在 0-65535 之间，0 表示不启用");
+        }
+        if (candidate.AgentPort > 0
+            && string.IsNullOrWhiteSpace(candidate.AgentToken)
+            && string.IsNullOrWhiteSpace(candidate.AgentTokenEnvironmentVariable))
+        {
+            errors.Add("启用备用端口时必须填写备用令牌或令牌环境变量");
+        }
 
         // 1.2 别名唯一（排除自身）
         var duplicated = existing

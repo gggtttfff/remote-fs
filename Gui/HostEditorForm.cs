@@ -40,6 +40,9 @@ public sealed class HostEditorForm : Form
     private readonly CheckBox _strictHostKeyCheck = new() { Text = "强制校验（指纹不一致时拒绝连接）", AutoSize = true };
     private readonly TextBox _allowedRootsBox = new();
     private readonly NumericUpDown _commandTimeoutBox = new();
+    private readonly NumericUpDown _agentPortBox = new() { Minimum = 0, Maximum = 65535 };
+    private readonly TextBox _agentTokenBox = new() { UseSystemPasswordChar = true };
+    private readonly TextBox _agentTokenEnvironmentVariableBox = new();
     private readonly ComboBox _encodingCombo = new();
     private readonly TextBox _descriptionBox = new();
     private readonly Label _banner = new();
@@ -174,6 +177,8 @@ public sealed class HostEditorForm : Form
         _commandTimeoutBox.Maximum = 600_000;
         _commandTimeoutBox.Increment = 1_000;
         _commandTimeoutBox.Value = 60_000;
+
+        _agentPortBox.Value = 0;
 
         _encodingCombo.DropDownStyle = ComboBoxStyle.DropDownList;
         RefreshEncodingItems(null);
@@ -338,6 +343,9 @@ public sealed class HostEditorForm : Form
         AddEditorRow(table, string.Empty, _strictHostKeyCheck);
         AddEditorRow(table, "允许根目录", _allowedRootsBox);
         AddEditorRow(table, "命令超时(ms)", _commandTimeoutBox);
+        AddEditorRow(table, "备用端口", _agentPortBox);
+        AddEditorRow(table, "备用令牌", _agentTokenBox);
+        AddEditorRow(table, "令牌环境变量", _agentTokenEnvironmentVariableBox);
         AddEditorRow(table, "默认编码", _encodingCombo);
         AddEditorRow(table, "备注", _descriptionBox);
 
@@ -517,6 +525,9 @@ public sealed class HostEditorForm : Form
         yield return _strictHostKeyCheck;
         yield return _allowedRootsBox;
         yield return _commandTimeoutBox;
+        yield return _agentPortBox;
+        yield return _agentTokenBox;
+        yield return _agentTokenEnvironmentVariableBox;
         yield return _encodingCombo;
         yield return _descriptionBox;
     }
@@ -589,6 +600,9 @@ public sealed class HostEditorForm : Form
         _strictHostKeyCheck.Checked = profile.StrictHostKeyChecking;
         _allowedRootsBox.Text = string.Join(", ", profile.AllowedRoots);
         _commandTimeoutBox.Value = Math.Clamp(profile.CommandTimeoutMilliseconds, 1_000, 600_000);
+        _agentPortBox.Value = Math.Clamp(profile.AgentPort, 0, 65535);
+        _agentTokenBox.Text = profile.AgentToken ?? string.Empty;
+        _agentTokenEnvironmentVariableBox.Text = profile.AgentTokenEnvironmentVariable ?? string.Empty;
         _descriptionBox.Text = profile.Description ?? string.Empty;
 
         RefreshEncodingItems(profile.DefaultEncoding);
@@ -666,6 +680,9 @@ public sealed class HostEditorForm : Form
             KnownHostKeyFingerprint = NullIfBlank(_fingerprintBox.Text),
             AllowedRoots = ParseAllowedRoots(_allowedRootsBox.Text),
             CommandTimeoutMilliseconds = (int)_commandTimeoutBox.Value,
+            AgentPort = (int)_agentPortBox.Value,
+            AgentToken = NullIfBlank(_agentTokenBox.Text),
+            AgentTokenEnvironmentVariable = NullIfBlank(_agentTokenEnvironmentVariableBox.Text),
             DefaultEncoding = ResolveEncodingValue(),
             Description = NullIfBlank(_descriptionBox.Text)
         };
@@ -689,6 +706,9 @@ public sealed class HostEditorForm : Form
         _strictHostKeyCheck.Checked = true;
         _allowedRootsBox.Text = string.Empty;
         _commandTimeoutBox.Value = 60_000;
+        _agentPortBox.Value = 0;
+        _agentTokenBox.Text = string.Empty;
+        _agentTokenEnvironmentVariableBox.Text = string.Empty;
         RefreshEncodingItems(null);
         _encodingCombo.SelectedItem = FollowGlobalEncodingText;
         _descriptionBox.Text = string.Empty;

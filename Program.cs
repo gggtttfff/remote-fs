@@ -1,4 +1,5 @@
 using System.Text.Json;
+using RemoteFs.Agent;
 using RemoteFs.Common;
 using RemoteFs.Config;
 using RemoteFs.Logging;
@@ -43,6 +44,9 @@ public static class Program
             {
                 case "serve":
                     return await ServeAsync();
+
+                case "listen":
+                    return await ListenAsync(rest);
 
                 case "hosts":
                     return HostsCommand.Execute(rest);
@@ -154,7 +158,9 @@ public static class Program
                         {
                             service.Cache.InvalidateHost(hostName);
                         }
-                    });
+                    },
+                    (toolName, toolArguments, exception) =>
+                        AgentChannelClient.TryFallback(toolName, toolArguments, exception));
 
                 // 兜底：进程被强制结束时也尽量把远程任务收掉，避免留下孤儿构建
                 AppDomain.CurrentDomain.ProcessExit += (_, _) =>
@@ -179,6 +185,28 @@ public static class Program
         }
 
         return 0;
+    }
+
+    /// <summary>
+    /// 在本机监听备用端口。给放在 Linux 服务器上的那一份进程用。
+    /// </summary>
+    private static async Task<int> ListenAsync(string[] args)
+    {
+        var configStore = new ConfigStore();
+        var config = configStore.LoadConfig();
+        AuditLogger.Enabled = config.AuditLogEnabled;
+        ConfigureAuditLog(config);
+        ConfigStore.EnsureInitialized();
+
+        using var cancellation = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, eventArgs) =>
+        {
+            eventArgs.Cancel = true;
+            cancellation.Cancel();
+        };
+
+        var port = AgentListener.ResolvePort(config, args);
+        return await AgentListener.RunAsync(config, port, cancellation.Token);
     }
 
     /// <summary>
@@ -235,6 +263,7 @@ public static class Program
             用法:
               remote-fs                          打开图形配置界面（仅 Windows，等同于 gui）
               remote-fs serve                    启动 MCP stdio 服务（供 Claude Code 等客户端连接）
+              remote-fs listen [--port 43336]   在本机监听备用端口（放在 Linux 服务器上）
               remote-fs gui                      打开主机配置图形界面（仅 Windows）
               remote-fs hosts list               列出已配置主机
               remote-fs hosts add <别名>         交互式添加主机配置

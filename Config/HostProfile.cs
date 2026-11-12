@@ -69,6 +69,15 @@ public sealed class HostProfile
     /// <summary>备注说明</summary>
     public string? Description { get; set; }
 
+    /// <summary>SSH 不可用时改连的备用端口。0 表示不启用。</summary>
+    public int AgentPort { get; set; }
+
+    /// <summary>备用端口的共享令牌。优先使用环境变量，避免明文落盘。</summary>
+    public string? AgentToken { get; set; }
+
+    /// <summary>从该环境变量读取备用端口令牌，优先于 <see cref="AgentToken"/>。</summary>
+    public string? AgentTokenEnvironmentVariable { get; set; }
+
     /// <summary>读取登录密码，优先取环境变量</summary>
     public string? ResolvePassword()
     {
@@ -81,5 +90,20 @@ public sealed class HostProfile
             }
         }
         return Password;
+    }
+
+    /// <summary>读取备用端口令牌，优先取环境变量</summary>
+    public string? ResolveAgentToken()
+    {
+        if (!string.IsNullOrWhiteSpace(AgentTokenEnvironmentVariable))
+        {
+            var value = Environment.GetEnvironmentVariable(AgentTokenEnvironmentVariable);
+            if (!string.IsNullOrEmpty(value))
+            {
+                return value;
+            }
+        }
+
+        return AgentToken;
     }
 }

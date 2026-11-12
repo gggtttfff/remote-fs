@@ -203,19 +203,38 @@ public sealed class RemoteFsService : IDisposable
     }
 
     /// <summary>
-    /// 取出一条 SFTP 连接，调用方 using 释放即可，底层连接会被连接池复用
+    /// 取出一条 SFTP 连接，调用方 using 释放即可，底层连接会被连接池复用。
+    /// 连接阶段失败时抛出 <see cref="Agent.SshUnavailableException"/>，供备用端口接手。
     /// </summary>
     public SftpLease OpenSftp(HostProfile profile)
     {
-        return _sftpPool.Acquire(profile);
+        try
+        {
+            return _sftpPool.Acquire(profile);
+        }
+        catch (Exception exception) when (exception is not Agent.SshUnavailableException
+                                         && Agent.SshUnavailableException.IsTransportDown(exception))
+        {
+            throw new Agent.SshUnavailableException(profile, exception);
+        }
     }
 
     /// <summary>
-    /// 建立 SSH 连接，调用方负责释放
+    /// 建立 SSH 连接，调用方负责释放。
+    /// 连接阶段失败时抛出 <see cref="Agent.SshUnavailableException"/>。
     /// </summary>
     public SshClient OpenSsh(HostProfile profile, out string fingerprint)
     {
-        return _connectionFactory.CreateSshClient(profile, out fingerprint);
+        try
+        {
+            return _connectionFactory.CreateSshClient(profile, out fingerprint);
+        }
+        catch (Exception exception) when (exception is not Agent.SshUnavailableException
+                                         && Agent.SshUnavailableException.IsTransportDown(exception))
+        {
+            fingerprint = string.Empty;
+            throw new Agent.SshUnavailableException(profile, exception);
+        }
     }
 
     /// <summary>

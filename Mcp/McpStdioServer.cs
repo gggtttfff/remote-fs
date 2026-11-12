@@ -14,15 +14,18 @@ public sealed class McpStdioServer
     private readonly JsonSerializerOptions _jsonOptions;
     private readonly Func<string?>? _hostResolver;
     private readonly Action<string, string?>? _onMutatingTool;
+    private readonly Func<string, JsonObject, Exception, ToolResult?>? _agentFallback;
 
     public McpStdioServer(
         IReadOnlyList<ToolDefinition> tools,
         Func<string?>? hostResolver = null,
-        Action<string, string?>? onMutatingTool = null)
+        Action<string, string?>? onMutatingTool = null,
+        Func<string, JsonObject, Exception, ToolResult?>? agentFallback = null)
     {
         _tools = tools;
         _hostResolver = hostResolver;
         _onMutatingTool = onMutatingTool;
+        _agentFallback = agentFallback;
         _jsonOptions = new JsonSerializerOptions
         {
             Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
@@ -215,10 +218,33 @@ public sealed class McpStdioServer
         }
         catch (Exception exception)
         {
-            // 异常统一转成错误结果，让模型能读到原因并自行纠正
-            AuditLogger.Error($"工具 {toolName} 执行失败: {exception}");
-            errorDetail = exception.ToString();
-            result = ToolResult.Error($"工具 {toolName} 执行失败: {exception.Message}");
+            ToolResult? fallback = null;
+            if (_agentFallback is not null)
+            {
+                try
+                {
+                    fallback = _agentFallback(toolName, arguments, exception);
+                }
+                catch (Exception fallbackException)
+                {
+                    AuditLogger.Error($"备用通道失败: {fallbackException}");
+                    fallback = ToolResult.Error(
+                        $"{exception.Message}{Environment.NewLine}备用通道失败: {fallbackException.Message}");
+                }
+            }
+
+            if (fallback is not null)
+            {
+                result = fallback;
+                errorDetail = fallback.IsError ? fallback.Text : null;
+            }
+            else
+            {
+                // 异常统一转成错误结果，让模型能读到原因并自行纠正
+                AuditLogger.Error($"工具 {toolName} 执行失败: {exception}");
+                errorDetail = exception.ToString();
+                result = ToolResult.Error($"工具 {toolName} 执行失败: {exception.Message}");
+            }
         }
         stopwatch.Stop();
 

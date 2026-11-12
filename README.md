@@ -129,6 +129,7 @@ remote-fs hosts fingerprint web1
 ```
 remote-fs                          打开图形配置界面（仅 Windows，等同于 gui）
 remote-fs serve                    启动 MCP stdio 服务
+remote-fs listen [--port 43336]   在 Linux 服务器上监听备用端口
 remote-fs gui                      打开图形界面（仅 Windows）
 remote-fs hosts list               列出已配置主机
 remote-fs hosts add <别名>         交互式添加主机
@@ -159,6 +160,29 @@ remote-fs gui
 「关闭窗口时驻留后台」开启后，点关闭只收进托盘，从托盘菜单选退出才结束进程。开机启动写入当前用户的 Run 注册表项，以注册表为准。
 
 Linux / macOS 没有图形界面，用上面的 `hosts` 与 `config` 子命令。
+
+## SSH 不可用时的备用端口
+
+文件读写默认走 SSH。SSH 在连接阶段失败（端口不通、握手超时）时，如果这台主机配置了备用端口，同一次工具调用会自动改走该端口。认证失败和指纹不符不会切换。
+
+备用端口跑在 **Linux 服务器本机**，直接改本机文件，不经过 SFTP。目前承接 `remote_read_file`、`remote_write_file`、`remote_edit_file`、`remote_patch`、`remote_ls`、`remote_stat`、`remote_mkdir`、`remote_remove`。命令、上传下载和后台任务仍然只走 SSH。
+
+服务器上：
+
+```bash
+export REMOTE_FS_AGENT_TOKEN='一段足够长的随机串'
+# config/config.json 里写明允许修改的目录，例如 "agentAllowedRoots": ["/var/www"]
+remote-fs listen --port 43336
+```
+
+Windows 上的主机配置增加：
+
+```json
+"agentPort": 43336,
+"agentTokenEnvironmentVariable": "REMOTE_FS_AGENT_TOKEN"
+```
+
+两边的令牌必须一致。端口没有 TLS，令牌会在连接里传输，只对需要访问的来源 IP 放开 43336。`agentAllowedRoots` 为空时拒绝监听。写成 `["/"]` 表示允许本机全部路径。
 
 ## 日志
 
@@ -196,6 +220,8 @@ Linux / macOS 没有图形界面，用上面的 `hosts` 与 `config` 子命令�
     "knownHostKeyFingerprint": "SHA256:xxxxxxxxxxxxxxxxxxxx=",
     "allowedRoots": ["/etc/nginx", "/var/www"],
     "commandTimeoutMilliseconds": 60000,
+    "agentPort": 43336,
+    "agentTokenEnvironmentVariable": "REMOTE_FS_AGENT_TOKEN",
     "description": "生产环境 web 服务器"
   }
 ]
@@ -212,6 +238,9 @@ Linux / macOS 没有图形界面，用上面的 `hosts` 与 `config` 子命令�
 | `knownHostKeyFingerprint` | 期望的 SHA256 指纹，带 `SHA256:` 前缀 |
 | `allowedRoots` | 允许访问的路径根。空数组表示不限制，访问时会在日志里告警 |
 | `commandTimeoutMilliseconds` | 前台命令的等待时间，默认 60 秒。超时后终止进程组并返回已有输出 |
+| `agentPort` | SSH 连不上时改用的备用端口。0 或不写表示不启用。服务器需先执行 `remote-fs listen` |
+| `agentToken` | 备用端口令牌。会明文进配置文件 |
+| `agentTokenEnvironmentVariable` | 从该环境变量读备用端口令牌，优先于 `agentToken` |
 
 `strictHostKeyChecking` 为 `true` 且没有 `knownHostKeyFingerprint` 时，连接会被拒绝。先执行 `remote-fs hosts fingerprint <别名>` 写入指纹，或把该主机的强校验关掉。
 
@@ -243,7 +272,9 @@ Linux / macOS 没有图形界面，用上面的 `hosts` 与 `config` 子命令�
   "backgroundJobTtlMinutes": 30,
   "jobRetentionDays": 7,
   "jobMaxCount": 50,
-  "stayInBackgroundOnExit": false
+  "stayInBackgroundOnExit": false,
+  "agentListenPort": 43336,
+  "agentAllowedRoots": ["/var/www"]
 }
 ```
 
@@ -259,6 +290,9 @@ Linux / macOS 没有图形界面，用上面的 `hosts` 与 `config` 子命令�
 | `backgroundJobTtlMinutes` | 后台任务默认时限，默认 30 分钟。单次调用可用 `ttlMinutes` 覆盖 |
 | `jobRetentionDays` / `jobMaxCount` | 远端已结束任务的保留天数，以及每台主机最多保留多少条 |
 | `stayInBackgroundOnExit` | 仅 Windows 图形界面：关闭主窗口时收进托盘 |
+| `agentListenPort` | 服务器上 `remote-fs listen` 未指定 `--port` 时使用的端口。0 表示用默认 43336 |
+| `agentListenToken` | 备用通道令牌。环境变量 `REMOTE_FS_AGENT_TOKEN` 优先 |
+| `agentAllowedRoots` | 备用通道允许修改的本机目录。为空时拒绝监听 |
 | `logLevel` | `Debug` / `Info` / `Warn` / `Error` |
 | `logRecordPayloads` | 是否记录工具调用的完整出入参 |
 | `logTraceToolTiming` | 为 `true` 时，每次工具调用额外写一条 `tool_timing`，只含工具名、主机、耗时和成败，不含文件内容。默认关闭 |
