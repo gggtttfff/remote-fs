@@ -288,6 +288,46 @@ public sealed class RemoteFsService : IDisposable
     }
 
     /// <summary>
+    /// 覆盖写之后把原来的权限与属主补回去。
+    /// 原子写是「临时文件 + rename」，新文件的权限和属主来自临时文件，
+    /// 不补的话 600 的私钥会变成 644、别的用户拥有的文件会变成当前用户拥有
+    /// </summary>
+    public void RestoreFileAttributes(
+        HostProfile profile, SftpClient sftp, string remotePath, FileAttributesSnapshot? original)
+    {
+        if (original is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var command = RemoteFileAttributes.BuildRestoreCommand(sftp, remotePath, original);
+            if (command is null)
+            {
+                return;
+            }
+
+            var output = ExecuteCommand(profile, command, 30_000);
+            if (output.ExitCode != 0)
+            {
+                AuditLogger.Warn(
+                    $"恢复文件属性失败 [{profile.Name}] {remotePath}: {output.StandardError.Trim()}");
+                return;
+            }
+
+            AuditLogger.Info(
+                $"已恢复文件属性 [{profile.Name}] {remotePath}"
+                + $"（{Convert.ToString(original.Mode, 8).PadLeft(4, '0')} {original.UserId}:{original.GroupId}）");
+        }
+        catch (Exception exception)
+        {
+            // 文件内容已经写好，属性恢复失败只能留痕，不能把写入算成失败
+            AuditLogger.Warn($"恢复文件属性异常 [{profile.Name}] {remotePath}: {exception.Message}");
+        }
+    }
+
+    /// <summary>
     /// 截断过长的输出，并追加提示
     /// </summary>
     public string TruncateOutput(string text)

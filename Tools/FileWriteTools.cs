@@ -33,12 +33,150 @@ public sealed class FileWriteTools
         {
             BuildWriteFile(),
             BuildEditFile(),
+            BuildPatch(),
             BuildMakeDirectory(),
             BuildRemove(),
             BuildMove(),
             BuildCopy(),
             BuildChmod(),
             BuildCreateLink()
+        };
+    }
+
+    /// <summary>
+    /// 按行号区间替换文件内容。内容不进上下文，适合大文件
+    /// </summary>
+    private ToolDefinition BuildPatch()
+    {
+        var schema = SchemaBuilder.Object(
+            new (string, JsonElement)[]
+            {
+                ("host", SchemaBuilder.String("目标主机别名，未指定则使用默认主机")),
+                ("path", SchemaBuilder.String("远程文件绝对路径")),
+                ("startLine", SchemaBuilder.Integer("要替换的起始行号，从 1 开始", 1)),
+                ("endLine", SchemaBuilder.Integer(
+                    "要替换的结束行号（含该行），省略时只替换 startLine 这一行", 1)),
+                ("content", SchemaBuilder.String(
+                    "替换后的行内容。多行用换行分隔；空字符串表示删除这些行")),
+                ("encoding", SchemaBuilder.String(
+                    "替换内容使用的文本编码。缺省时按主机配置→全局配置取值（默认 utf-8）。"
+                    + "只影响新写入的行，文件原有部分的字节原样保留"))
+            },
+            new[] { "path", "startLine", "content" });
+
+        return new ToolDefinition
+        {
+            Name = "remote_patch",
+            Description = "按行号区间替换远程文件的内容，只把新内容发上去，文件其余部分原样保留。"
+                + "适合改大文件的某几行：内容不需要整体读进对话，内存占用与文件大小无关。"
+                + "行号从 1 开始，endLine 含该行，content 为空表示删除这些行。"
+                + "写入走临时文件 + rename，并保留原文件的权限与属主。",
+            InputSchema = schema,
+            Annotations = ToolAnnotations.Modifying,
+            Handler = context =>
+            {
+                var profile = _service.ResolveHost(context.GetString("host"));
+                var path = context.RequireString("path");
+                var startLine = context.GetInt("startLine") ?? 0;
+                var endLine = context.GetInt("endLine") ?? startLine;
+                var content = context.RequireText("content");
+
+                // 1.1 行号必须先校验，越界的话后面会白跑一趟传输
+                if (startLine < 1)
+                {
+                    return ToolResult.Error("startLine 必须从 1 开始");
+                }
+                if (endLine < startLine)
+                {
+                    return ToolResult.Error($"endLine({endLine}) 不能小于 startLine({startLine})");
+                }
+
+                // 1.2 白名单先于连接校验，越界路径不触发任何远程调用
+                _service.EnsurePathAllowed(profile, path);
+
+                using var lease = _service.OpenSftp(profile);
+                var sftp = lease.Client;
+                _service.EnsureNotSymbolicLink(profile, sftp, path);
+
+                if (!sftp.Exists(path))
+                {
+                    return ToolResult.Error($"文件 {path} 不存在");
+                }
+
+                var encodingName = _service.ResolveEncodingName(profile, context.GetString("encoding"));
+                var encodingError = RemoteFsService.ValidateEncodingName(encodingName);
+                if (encodingError is not null)
+                {
+                    return ToolResult.Error(encodingError);
+                }
+
+                byte[] payload;
+                try
+                {
+                    payload = TextEncodingResolver.ResolveForWrite(encodingName).GetBytes(content);
+                }
+                catch (EncoderFallbackException)
+                {
+                    return ToolResult.Error(
+                        $"无法用 {encodingName} 编码替换内容：文本中包含该编码无法表示的字符。"
+                        + "请改用 encoding=gb18030 或 encoding=utf-8。");
+                }
+
+                // 2.1 记下原属性：服务端拼接用 mv 覆盖，文件会换成新 inode
+                var originalAttributes = RemoteFileAttributes.Capture(sftp, path);
+
+                // 2.2 替换内容单独传成一个临时文件，文件本体不出服务器
+                var directory = RemoteFileWriter.GetParentDirectory(path);
+                var fileName = Path.GetFileName(path);
+                var payloadPath = PathGuard.Combine(directory, $".{fileName}.patch.{Guid.NewGuid():N}");
+                var temporaryPath = PathGuard.Combine(directory, $".{fileName}.tmp.{Guid.NewGuid():N}");
+                var writtenLines = CountLines(payload);
+
+                try
+                {
+                    var payloadBytes = EnsureLineEnding(payload);
+                    using (var payloadStream = sftp.Create(payloadPath))
+                    {
+                        payloadStream.Write(payloadBytes, 0, payloadBytes.Length);
+                    }
+                    writtenLines = CountLines(payloadBytes);
+
+                    var command = RemoteFilePatcher.BuildSpliceCommand(
+                        path, payloadPath, temporaryPath, startLine, endLine);
+                    var output = _service.ExecuteCommand(profile, command, 120_000);
+
+                    // 2.3 行号越界要单独报，别让用户以为是替换失败
+                    if (output.ExitCode == RemoteFilePatcher.ExitLineOutOfRange)
+                    {
+                        var total = output.StandardOutput.Replace("OUT_OF_RANGE:", string.Empty).Trim();
+                        return ToolResult.Error(
+                            $"文件 {path} 只有 {total} 行，没有第 {startLine} 行。"
+                            + "请先用 remote_read_file 确认行号。");
+                    }
+                    if (output.ExitCode != 0)
+                    {
+                        return ToolResult.Error(
+                            $"按行替换失败（退出码 {output.ExitCode}）："
+                            + $"{output.StandardError.Trim()}{output.StandardOutput.Trim()}");
+                    }
+
+                    _service.RestoreFileAttributes(profile, sftp, path, originalAttributes);
+                }
+                finally
+                {
+                    // 临时文件无论成败都要清掉
+                    RemoteFileWriter.TryDelete(sftp, payloadPath);
+                    RemoteFileWriter.TryDelete(sftp, temporaryPath);
+                }
+
+                AuditLogger.Info(
+                    $"按行替换 [{profile.Name}] {path} 第 {startLine}-{endLine} 行 -> {writtenLines} 行");
+
+                var summary = content.Length == 0
+                    ? $"已删除 {path} 的第 {startLine}-{endLine} 行"
+                    : $"已将 {path} 的第 {startLine}-{endLine} 行替换为 {writtenLines} 行";
+                return ToolResult.Ok($"{summary}（主机 {profile.Name}）");
+            }
         };
     }
 
@@ -117,6 +255,11 @@ public sealed class FileWriteTools
                     append = false;
                 }
 
+                // 1.2 覆盖写会把文件换成新 inode，先记下原有权限与属主
+                var originalAttributes = existed && !append
+                    ? RemoteFileAttributes.Capture(sftp, path)
+                    : null;
+
                 // 编码器是严格模式：目标编码表示不了的字符会抛异常，必须转成能自愈的提示
                 try
                 {
@@ -130,10 +273,16 @@ public sealed class FileWriteTools
                         + "请改用 encoding=gb18030 或 encoding=utf-8。");
                 }
 
-                // 1.2 写入按需调整权限位，权限值按八进制解析（如 644）
+                // 1.3 显式指定权限就按指定值设，否则覆盖写要补回原来的属性。
+                // SSH.NET 的 ChangePermissions 写入的模式位是错的，一律走服务端 chmod
                 if (!string.IsNullOrWhiteSpace(permissionsText))
                 {
-                    sftp.ChangePermissions(path, permissions);
+                    var octal = Convert.ToString(permissions, 8).PadLeft(4, '0');
+                    RunCommandOrThrow(profile, $"chmod {octal} -- {ShellQuoting.Quote(path)}");
+                }
+                else if (originalAttributes is not null)
+                {
+                    _service.RestoreFileAttributes(profile, sftp, path, originalAttributes);
                 }
 
                 var size = sftp.GetAttributes(path).Size;
@@ -188,8 +337,11 @@ public sealed class FileWriteTools
                 var sftp = lease.Client;
                 _service.EnsureNotSymbolicLink(profile, sftp, path);
 
+                // 1.2 记下原来的权限与属主：原子写是临时文件 + rename，不补就会被临时文件的属性顶掉
+                var originalAttributes = RemoteFileAttributes.Capture(sftp, path);
+
                 var (content, totalLength, truncated) = RemoteFileReader.Read(
-                    sftp, path, 0, -1, _service.Config.MaxReadBytes);
+                    sftp, path, 0, -1, _service.Config.MaxReadBytes, rejectWhenExceedsMaxBytes: true);
 
                 // 1.2 只读到了文件的一部分，整体写回会静默截断
                 if (truncated)
@@ -254,6 +406,9 @@ public sealed class FileWriteTools
                         $"无法用 {decoded.EncodingName} 编码写回文件 {path}：新文本中包含该编码无法表示的字符。"
                         + "请改用 encoding=gb18030 或 encoding=utf-8。");
                 }
+
+                // 1.4 rename 之后补回原来的权限与属主
+                _service.RestoreFileAttributes(profile, sftp, path, originalAttributes);
 
                 var replacedCount = replaceAll ? occurrences : 1;
                 AuditLogger.Info($"编辑文件 [{profile.Name}] {path}，替换 {replacedCount} 处");
@@ -706,6 +861,44 @@ public sealed class FileWriteTools
             throw new InvalidOperationException(
                 $"执行 {command} 失败（退出码 {output.ExitCode}）：{output.StandardError.Trim()}");
         }
+    }
+
+    /// <summary>
+    /// 保证替换内容以换行结尾，避免和下面一行粘在一起
+    /// </summary>
+    private static byte[] EnsureLineEnding(byte[] content)
+    {
+        if (content.Length == 0 || content[^1] == (byte)'\n')
+        {
+            return content;
+        }
+
+        var payload = new byte[content.Length + 1];
+        content.CopyTo(payload, 0);
+        payload[^1] = (byte)'\n';
+        return payload;
+    }
+
+    /// <summary>
+    /// 统计字节里的行数
+    /// </summary>
+    private static int CountLines(byte[] content)
+    {
+        if (content.Length == 0)
+        {
+            return 0;
+        }
+
+        var count = 0;
+        foreach (var value in content)
+        {
+            if (value == (byte)'\n')
+            {
+                count++;
+            }
+        }
+        // 末尾没有换行符时，最后一段也算一行
+        return content[^1] == (byte)'\n' ? count : count + 1;
     }
 
     /// <summary>

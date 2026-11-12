@@ -5,7 +5,7 @@ description: 通过 remote-fs MCP 直接操作远程服务器文件与命令，�
 
 # 远程服务器操作
 
-22 个工具。`host` 参数省略时用配置里的默认主机；不确定别名先调 `remote_list_hosts`。
+23 个工具。`host` 参数省略时用配置里的默认主机；不确定别名先调 `remote_list_hosts`。
 
 ## 工具速查
 
@@ -16,6 +16,7 @@ description: 通过 remote-fs MCP 直接操作远程服务器文件与命令，�
 | 查属性 | `remote_stat` | 类型、大小、权限、属主、时间 |
 | 搜内容 | `remote_search` | 比逐个读文件快，受 `maxResults` 限制 |
 | 改文件 | `remote_edit_file` | **改配置首选**，精确替换 + 原子写入 |
+| 改大文件 | `remote_patch` | **按行号区间替换**，内容不进上下文，文件多大都行 |
 | 重写文件 | `remote_write_file` | 整体覆盖；`append=true` 追加；`permissions` 先校验后写 |
 | 增删移 | `remote_mkdir` / `remote_remove` / `remote_move` / `remote_copy` | 见下方限制 |
 | 权限链接 | `remote_chmod` / `remote_symlink` | 八进制如 644 |
@@ -36,6 +37,20 @@ description: 通过 remote-fs MCP 直接操作远程服务器文件与命令，�
 - `oldText` 必须精确匹配，含缩进与换行
 - 多处匹配会报错：补充上下文，或显式 `replaceAll=true`
 - **文件超过读取上限（默认 1MB）会直接拒绝**，此时改走 `remote_download` → 本地修改 → `remote_upload`
+
+### 大文件用 patch，不用 edit
+
+`remote_edit_file` 会把整个文件读进来、再整体写回，**文件超过单次读取上限（默认 1MB）直接拒绝**。改大文件的某几行要用 `remote_patch`：
+
+```
+remote_patch(path="/var/log/app.log", startLine=5000, endLine=5007, content="新的内容")
+remote_patch(path="/etc/hosts", startLine=12, content="")      // 空内容 = 删除这一行
+```
+
+- 行号从 1 开始，`endLine` 含该行，省略时只改 `startLine` 一行
+- **只把新内容发上去**，文件其余部分在服务器上原样保留，内容不进上下文
+- 全程按字节处理，GBK/GB18030 等编码的文件不会被破坏
+- 覆盖写会保留原文件的权限与属主
 
 ### 定位配置项直接搜
 

@@ -17,8 +17,14 @@ public static class RemoteFileReader
     /// <param name="offset">起始字节偏移</param>
     /// <param name="length">读取字节数，-1 表示读取到末尾</param>
     /// <param name="maxBytes">单次读取上限</param>
+    /// <param name="rejectWhenExceedsMaxBytes">
+    /// 超过上限时不传输直接返回截断标记。
+    /// 文件大小在读之前就已经知道了，需要"整份内容才敢往下做"的调用方（例如编辑）应该打开它，
+    /// 否则会先白传一遍上限大小的数据再报错
+    /// </param>
     public static (byte[] Content, long TotalLength, bool Truncated) Read(
-        SftpClient sftp, string remotePath, long offset, long length, int maxBytes)
+        SftpClient sftp, string remotePath, long offset, long length, int maxBytes,
+        bool rejectWhenExceedsMaxBytes = false)
     {
         var totalLength = sftp.GetAttributes(remotePath).Size;
 
@@ -29,6 +35,12 @@ public static class RemoteFileReader
         if (offset >= totalLength)
         {
             return (Array.Empty<byte>(), totalLength, false);
+        }
+
+        // 1.1 大文件提前拒绝：不传输，直接告诉调用方内容不完整
+        if (rejectWhenExceedsMaxBytes && totalLength - offset > maxBytes)
+        {
+            return (Array.Empty<byte>(), totalLength, true);
         }
 
         // 实际读取长度受请求长度与单次上限双重约束
