@@ -54,6 +54,12 @@ public sealed class AppConfig
     /// <summary>是否记录工具调用的完整出入参。开启后服务器上的文件内容会明文落盘</summary>
     public bool LogRecordPayloads { get; set; } = true;
 
+    /// <summary>
+    /// 是否额外记录每次 MCP 工具调用的耗时。
+    /// 开启后每次调用再写一条 tool_timing，只含工具名、主机、耗时和成败，不含文件内容。
+    /// </summary>
+    public bool LogTraceToolTiming { get; set; }
+
     /// <summary>单个日志文件的大小上限（字节），超过后自动分割</summary>
     public long LogMaxFileSizeBytes { get; set; } = 10 * 1024 * 1024;
 

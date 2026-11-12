@@ -454,6 +454,14 @@ public sealed class LogViewTab : UserControl
         {
             builder.AppendLine($"耗时: {elapsed} 毫秒");
         }
+
+        // 耗时追踪没有出入参，详情只保留上面这几项
+        if (entry.Event == "tool_timing")
+        {
+            _detailBox.Text = builder.ToString();
+            return;
+        }
+
         builder.AppendLine();
         builder.AppendLine("=== 入参 ===");
         builder.AppendLine(entry.Arguments ?? "(未记录)");

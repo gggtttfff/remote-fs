@@ -172,6 +172,8 @@ Linux / macOS 没有图形界面，用上面的 `hosts` 与 `config` 子命令�
 
 `logRecordPayloads` 默认开启。AI 读写的服务器文件内容会明文落盘，其中可能有密码和密钥。不需要时在「日志设置」里关掉，或把 `logLevel` 调到 `Warn`。
 
+`logTraceToolTiming` 默认关闭。打开后，每次工具调用在原有日志之外再写一条 `tool_timing`，只保留工具名、主机、耗时和成败，方便对照文件编辑慢在哪一次调用。这条日志同样受 `logLevel` 过滤。
+
 日志视图向上翻时停止跟随，工具栏显示新增条数，滚回底部后恢复。日志设置保存在 `config/config.json`，改动后需要重启 MCP 服务端才会作用于 `serve` 进程。
 
 ## 配置
@@ -227,6 +229,7 @@ Linux / macOS 没有图形界面，用上面的 `hosts` 与 `config` 子命令�
   "auditLogEnabled": true,
   "logLevel": "Info",
   "logRecordPayloads": true,
+  "logTraceToolTiming": false,
   "logMaxFileSizeBytes": 10485760,
   "logRetentionDays": 7,
   "logMaxFiles": 20,
@@ -258,6 +261,7 @@ Linux / macOS 没有图形界面，用上面的 `hosts` 与 `config` 子命令�
 | `stayInBackgroundOnExit` | 仅 Windows 图形界面：关闭主窗口时收进托盘 |
 | `logLevel` | `Debug` / `Info` / `Warn` / `Error` |
 | `logRecordPayloads` | 是否记录工具调用的完整出入参 |
+| `logTraceToolTiming` | 为 `true` 时，每次工具调用额外写一条 `tool_timing`，只含工具名、主机、耗时和成败，不含文件内容。默认关闭 |
 
 ## MCP 工具
 

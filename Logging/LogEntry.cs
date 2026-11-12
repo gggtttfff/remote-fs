@@ -14,7 +14,7 @@ public sealed class LogEntry
 
     public int ProcessId { get; init; }
 
-    /// <summary>事件类型：tool_call / event / error</summary>
+    /// <summary>事件类型：tool_call / tool_timing / event / error</summary>
     public string Event { get; init; } = "event";
 
     public string? Message { get; init; }

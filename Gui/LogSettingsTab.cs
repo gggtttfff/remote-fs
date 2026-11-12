@@ -15,6 +15,7 @@ public sealed class LogSettingsTab : UserControl
 
     private readonly ComboBox _levelCombo = new();
     private readonly CheckBox _recordPayloadsCheckBox = new();
+    private readonly CheckBox _traceToolTimingCheckBox = new();
     private readonly NumericUpDown _maxFileSizeBox = new();
     private readonly NumericUpDown _retentionDaysBox = new();
     private readonly NumericUpDown _maxFilesBox = new();
@@ -103,6 +104,10 @@ public sealed class LogSettingsTab : UserControl
         _recordPayloadsCheckBox.Text = "记录工具调用的完整出入参（含文件内容）";
         _recordPayloadsCheckBox.AutoSize = true;
         AddRow(table, "出入参", _recordPayloadsCheckBox);
+
+        _traceToolTimingCheckBox.Text = "额外记录每次工具耗时（不含文件内容）";
+        _traceToolTimingCheckBox.AutoSize = true;
+        AddRow(table, "耗时追踪", _traceToolTimingCheckBox);
 
         _maxFileSizeBox.Minimum = 1;
         _maxFileSizeBox.Maximum = 1024;
@@ -226,6 +231,7 @@ public sealed class LogSettingsTab : UserControl
 
         _levelCombo.SelectedItem = config.LogLevel.ToString();
         _recordPayloadsCheckBox.Checked = config.LogRecordPayloads;
+        _traceToolTimingCheckBox.Checked = config.LogTraceToolTiming;
         _maxFileSizeBox.Value = Math.Clamp(config.LogMaxFileSizeBytes / (1024 * 1024), 1, 1024);
         _retentionDaysBox.Value = Math.Clamp(config.LogRetentionDays, 1, 365);
         _maxFilesBox.Value = Math.Clamp(config.LogMaxFiles, 1, 1000);
@@ -247,6 +253,7 @@ public sealed class LogSettingsTab : UserControl
                 config.LogLevel = level;
             }
             config.LogRecordPayloads = _recordPayloadsCheckBox.Checked;
+            config.LogTraceToolTiming = _traceToolTimingCheckBox.Checked;
             config.LogMaxFileSizeBytes = (long)_maxFileSizeBox.Value * 1024 * 1024;
             config.LogRetentionDays = (int)_retentionDaysBox.Value;
             config.LogMaxFiles = (int)_maxFilesBox.Value;

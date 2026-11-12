@@ -154,6 +154,27 @@ public static class AuditLogger
         };
 
         WriteEntry(entry, $"工具 {tool} {(success ? "完成" : "失败")} 耗时 {elapsedMilliseconds}ms");
+
+        if (!_settings.TraceToolTiming)
+        {
+            return;
+        }
+
+        // 耗时追踪单独成行，不带出入参，避免文件内容把耗时淹没，也避免追踪本身放大日志
+        var timing = new LogEntry
+        {
+            Timestamp = entry.Timestamp,
+            Level = entry.Level,
+            ProcessId = entry.ProcessId,
+            Event = "tool_timing",
+            Tool = tool,
+            Host = host,
+            ElapsedMilliseconds = elapsedMilliseconds,
+            Success = success,
+            Message = $"{tool} {(success ? "完成" : "失败")} {elapsedMilliseconds}ms"
+        };
+        WriteEntry(timing, null);
+        Flush();
     }
 
     private static void Write(LogLevel level, string message)
@@ -175,13 +196,16 @@ public static class AuditLogger
         WriteEntry(entry, message);
     }
 
-    private static void WriteEntry(LogEntry entry, string stderrText)
+    private static void WriteEntry(LogEntry entry, string? stderrText)
     {
         lock (Lock)
         {
             try
             {
-                WriteErrorText(entry.Level, stderrText);
+                if (!string.IsNullOrEmpty(stderrText))
+                {
+                    WriteErrorText(entry.Level, stderrText);
+                }
                 _fileWriter?.Write(entry);
             }
             catch
