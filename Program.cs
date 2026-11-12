@@ -100,6 +100,27 @@ public static class Program
             cancellation.Cancel();
         };
 
+        // 客户端被强杀、或管道写端被子进程继承时收不到 stdin EOF，
+        // 进程会一直留在后台占着 exe，所以再加一道父进程看护
+        ParentProcessWatchdog.Start(() =>
+        {
+            cancellation.Cancel();
+
+            // ReadLineAsync 阻塞在管道上时取消唤不醒它，必须强制退出。
+            // 留几秒让手头那次工具调用收尾；退出时 ProcessExit 钩子会杀掉远程任务并落盘日志
+            var forceExitThread = new Thread(() =>
+            {
+                Thread.Sleep(5_000);
+                AuditLogger.Warn("父进程已退出且主循环未响应取消，强制结束进程");
+                Environment.Exit(0);
+            })
+            {
+                IsBackground = true,
+                Name = "parent-watchdog-exit"
+            };
+            forceExitThread.Start();
+        });
+
         try
         {
             using (var service = new RemoteFsService(config, configStore))
