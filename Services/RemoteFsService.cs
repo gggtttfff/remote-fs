@@ -194,6 +194,46 @@ public sealed class RemoteFsService : IDisposable
     }
 
     /// <summary>
+    /// 解析本次操作使用的文本编码。
+    /// 优先级：工具参数 → 主机配置 → 全局配置 → auto。
+    /// </summary>
+    /// <param name="profile">目标主机</param>
+    /// <param name="explicitName">工具调用里显式指定的编码名，可为空</param>
+    public string ResolveEncodingName(HostProfile profile, string? explicitName)
+    {
+        if (!string.IsNullOrWhiteSpace(explicitName))
+        {
+            return TextEncodingResolver.Normalize(explicitName);
+        }
+
+        if (!string.IsNullOrWhiteSpace(profile.DefaultEncoding))
+        {
+            return TextEncodingResolver.Normalize(profile.DefaultEncoding);
+        }
+
+        if (!string.IsNullOrWhiteSpace(_config.DefaultEncoding))
+        {
+            return TextEncodingResolver.Normalize(_config.DefaultEncoding);
+        }
+
+        return TextEncodingResolver.Auto;
+    }
+
+    /// <summary>
+    /// 校验编码名是否受支持。写路径必须显式校验：
+    /// 写入用的编码解析对未知名是静默回退 UTF-8 的，不校验会把编码写错还不报错
+    /// </summary>
+    public static string? ValidateEncodingName(string encodingName)
+    {
+        if (TextEncodingResolver.IsSupported(encodingName))
+        {
+            return null;
+        }
+        return $"不支持的编码 \"{encodingName}\"。可用值："
+            + string.Join("、", TextEncodingResolver.SupportedNames);
+    }
+
+    /// <summary>
     /// 截断过长的输出，并追加提示
     /// </summary>
     public string TruncateOutput(string text)

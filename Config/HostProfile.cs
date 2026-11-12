@@ -63,6 +63,9 @@ public sealed class HostProfile
     /// <summary>命令执行超时（毫秒）</summary>
     public int CommandTimeoutMilliseconds { get; set; } = 60_000;
 
+    /// <summary>该主机的默认文本编码。null 表示跟随全局配置</summary>
+    public string? DefaultEncoding { get; set; }
+
     /// <summary>备注说明</summary>
     public string? Description { get; set; }
 

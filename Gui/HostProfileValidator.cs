@@ -1,3 +1,4 @@
+using RemoteFs.Common;
 using RemoteFs.Config;
 using RemoteFs.Ssh;
 
@@ -96,6 +97,14 @@ public static class HostProfileValidator
             {
                 errors.Add($"允许根目录必须是绝对路径: {root}");
             }
+        }
+
+        // 3.3 默认编码：空值表示跟随全局，非空必须是受支持的编码名
+        if (!string.IsNullOrWhiteSpace(candidate.DefaultEncoding)
+            && !TextEncodingResolver.IsSupported(candidate.DefaultEncoding))
+        {
+            errors.Add($"默认编码 \"{candidate.DefaultEncoding}\" 不受支持，可用值："
+                + string.Join("、", TextEncodingResolver.SupportedNames));
         }
 
         return errors;

@@ -25,6 +25,9 @@ public static class Program
             // 输出被重定向等场景下设置可能失败，不影响主流程
         }
 
+        // GBK/GB18030 等传统代码页不在 .NET 运行时里，需要注册提供程序后才能用
+        TextEncodingResolver.EnsureProviderRegistered();
+
         try
         {
             if (args.Length == 0)

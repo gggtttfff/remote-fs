@@ -52,6 +52,17 @@ description: 通过 remote-fs MCP 直接操作远程服务器文件与命令，�
 - `remotePath` 以 `/` 结尾表示按目录处理，保留本地文件名
 - 默认不覆盖，要覆盖必须传 `overwrite=true`
 
+### 编码
+
+服务器上的文件不一定是 UTF-8。GBK/GB18030 文件在没指定编码时会报「无法按 utf-8 解码」，**这不是二进制文件**。
+
+- 中文服务器建议**在主机配置里把「默认编码」设成 `gb18030`**，之后读写都不用再传参数
+- 单次需要时传 `encoding=`：`remote_read_file`、`remote_write_file`、`remote_edit_file`、`remote_search`、`remote_exec` 都支持
+- 带 BOM 的文件以 BOM 为准，与配置无关
+- `remote_exec` 的 `encoding` **只影响输出解码**；命令本身永远以 UTF-8 下发到服务器
+- **编辑非 UTF-8 文件必须显式传 `encoding`**，否则会解码失败——工具不会猜
+- 写文件时目标编码表示不了的字符会直接报错，不会静默变成问号
+
 ### 执行命令
 
 `remote_exec` 用于非文件操作：重启服务、查进程、看日志。退出码非 0 时工具返回错误结果，真实原因要读 stderr 段。
@@ -106,6 +117,8 @@ remote_job_status(jobId="...", stdoutOffset=8192)
 | 是符号链接 | 改用链接指向的真实路径 |
 | 文件超过读取上限 | 走 download → 本地改 → upload |
 | 命令执行失败 | 读 stderr 段与退出码，不要只看退出码 |
+| 无法按 utf-8 解码 | 文件不是 UTF-8，用 `encoding=gb18030` 重试，或把主机默认编码设为 gb18030 |
+| 无法用 x 编码写入 | 目标编码表示不了这些字符，改用 `encoding=gb18030` 或 `utf-8` |
 | 找不到任务 jobId | `remote_job_list` 确认编号；可能已被保留策略清理 |
 | pid 已被其他进程复用 | 工具拒绝终止以免误杀，把情况说明给用户，由用户人工确认 |
 | 任务已提交但没有写出 pid | 远端可能缺 `sh` 或任务目录不可写，让用户看该任务目录下的 `err` |

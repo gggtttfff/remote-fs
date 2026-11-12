@@ -7,7 +7,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>RemoteFs</AssemblyName>
     <RootNamespace>RemoteFs</RootNamespace>
-    <Version>1.2.1</Version>
+    <Version>1.3.0</Version>
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 
@@ -47,6 +47,8 @@
          已知告警中 GHSA-q939-rpr3-3284 与 GHSA-mggc-4xg6-vcxf 仅影响 ScpClient，
          本项目只用 SftpClient，不受影响，故在 NuGetAudit 中排除。 -->
     <PackageReference Include="SSH.NET" Version="2024.2.0" NoWarn="NU1903" />
+    <!-- GBK/GB18030 等传统代码页不在 .NET 运行时里，需要这个包提供 -->
+    <PackageReference Include="System.Text.Encoding.CodePages" Version="9.0.0" />
   </ItemGroup>
 
 </Project>

@@ -19,6 +19,16 @@ public sealed class SshConnectionFactory
     }
 
     /// <summary>
+    /// 一次 SSH 建连尝试的结果。失败时保留原始异常，由调用方分层判定，
+    /// 不在此处包装成面向用户的异常。
+    /// </summary>
+    internal sealed record SshConnectAttempt(
+        SshClient? Client,
+        string? Fingerprint,
+        string? ServerVersion,
+        Exception? Failure);
+
+    /// <summary>
     /// 创建并连接 SSH 客户端，指纹通过 <paramref name="fingerprint"/> 返回
     /// </summary>
     public SshClient CreateSshClient(HostProfile profile, out string fingerprint)
@@ -63,6 +73,30 @@ public sealed class SshConnectionFactory
         }
 
         return client;
+    }
+
+    /// <summary>
+    /// 诊断用：尝试建立 SSH 连接，失败时返回原始异常而不是抛出，
+    /// 便于上层判断失败落在哪一层。指纹与服务器版本在握手成功时一并返回。
+    /// </summary>
+    internal SshConnectAttempt TryCreateSshClient(HostProfile profile)
+    {
+        var capture = new HostKeyCapture();
+        SshClient? client = null;
+
+        try
+        {
+            client = new SshClient(BuildConnectionInfo(profile));
+            AttachHostKeyCheck(profile, client, capture);
+            client.Connect();
+        }
+        catch (Exception exception)
+        {
+            client?.Dispose();
+            return new SshConnectAttempt(null, capture.Fingerprint, null, exception);
+        }
+
+        return new SshConnectAttempt(client, capture.Fingerprint, client.ConnectionInfo.ServerVersion, null);
     }
 
     /// <summary>
@@ -143,32 +177,72 @@ public sealed class SshConnectionFactory
     }
 
     /// <summary>
-    /// 构造可读的连接失败异常
+    /// 构造可读的连接失败异常：按失败落在哪一层给出对应的处置建议。
+    /// 认证失败与指纹不匹配异常本身已能定位层次，不再额外拨一次 TCP；
+    /// 只有连接阶段失败才做 DNS 与 TCP 探测。
     /// </summary>
     private static Exception BuildConnectionFailure(
         HostProfile profile, HostKeyCapture capture, Exception inner)
     {
         var actual = FormatFingerprint(capture.Fingerprint);
 
-        // 1.1 开了强校验但还没固化指纹
-        if (capture.RejectionReason == "missing-fingerprint")
+        // 1.1 认证失败：异常本身已经定位到层次，不再做 DNS/TCP 探测
+        if (ConnectionDiagnostics.IsAuthenticationFailure(inner))
         {
             return new InvalidOperationException(
-                $"主机 {profile.Name} 启用了 strictHostKeyChecking，但未配置 knownHostKeyFingerprint。"
-                + $"请执行 remote-fs hosts fingerprint {profile.Name} 取到指纹（本次握手实际指纹 {actual}）"
-                + "填入配置后重试，或把该主机的 strictHostKeyChecking 设为 false。", inner);
+                ConnectionDiagnostics.FormatFailureMessage(
+                    profile,
+                    DiagnosticStage.Authentication,
+                    inner.Message,
+                    ConnectionDiagnostics.BuildAuthenticationAdvice(profile, inner),
+                    $"执行 remote-fs hosts fingerprint {profile.Name} 可核对服务器指纹。"),
+                inner);
         }
 
         // 1.2 指纹与固化值不一致
         if (capture.RejectionReason == "fingerprint-mismatch")
         {
             return new InvalidOperationException(
-                $"主机 {profile.Name} 的密钥指纹不匹配。期望 {profile.KnownHostKeyFingerprint}，实际 {actual}。"
-                + $"若服务器已重装，请执行 remote-fs hosts fingerprint {profile.Name} 更新配置。", inner);
+                ConnectionDiagnostics.FormatFailureMessage(
+                    profile,
+                    DiagnosticStage.HostKey,
+                    $"指纹不匹配，期望 {profile.KnownHostKeyFingerprint}，实际 {actual}",
+                    "服务器可能重装过或被中间人劫持，确认无误后再更新配置",
+                    $"若服务器已重装，请执行 remote-fs hosts fingerprint {profile.Name} 更新配置"),
+                inner);
         }
 
+        // 1.3 开了强校验但还没固化指纹
+        if (capture.RejectionReason == "missing-fingerprint")
+        {
+            return new InvalidOperationException(
+                ConnectionDiagnostics.FormatFailureMessage(
+                    profile,
+                    DiagnosticStage.HostKey,
+                    $"已启用 strictHostKeyChecking 但未配置 knownHostKeyFingerprint，本次握手实际指纹 {actual}",
+                    "把实际指纹固化到配置里，或把该主机的 strictHostKeyChecking 设为 false",
+                    $"请执行 remote-fs hosts fingerprint {profile.Name} 取到指纹填入配置后重试"),
+                inner);
+        }
+
+        // 1.4 连接阶段失败：这时才做 DNS 与 3 秒 TCP 探测，把结果拼进消息
+        if (ConnectionDiagnostics.IsConnectStageFailure(inner))
+        {
+            var finding = ConnectionDiagnostics.DiagnoseConnectStage(profile, inner);
+            return new InvalidOperationException(
+                ConnectionDiagnostics.FormatFailureMessage(profile, finding),
+                inner);
+        }
+
+        // 1.5 无法归类
         return new InvalidOperationException(
-            $"连接 {profile.Username}@{profile.Host}:{profile.Port} 失败: {inner.Message}", inner);
+            ConnectionDiagnostics.FormatFailureMessage(
+                profile,
+                DiagnosticStage.Unknown,
+                inner.Message,
+                "异常本身无法定位到具体层次，请结合服务端日志排查",
+                null),
+            inner);
     }
 
     /// <summary>

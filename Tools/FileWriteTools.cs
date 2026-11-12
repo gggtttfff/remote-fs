@@ -55,7 +55,12 @@ public sealed class FileWriteTools
                 ("content", SchemaBuilder.String("要写入的文本内容，可为空字符串表示清空文件")),
                 ("append", SchemaBuilder.Boolean("是否追加到文件末尾，默认覆盖", false)),
                 ("createParents", SchemaBuilder.Boolean("父目录不存在时是否自动创建", true)),
-                ("permissions", SchemaBuilder.String("文件权限位，如 644，默认保留原有权限"))
+                ("permissions", SchemaBuilder.String("文件权限位，如 644，默认保留原有权限")),
+                ("encoding", SchemaBuilder.String(
+                    "写入时使用的文本编码。缺省时按主机配置→全局配置取值（默认 utf-8，不写 BOM）。"
+                    + "可选值：utf-8、utf-8-bom、utf-16le、utf-16be、utf-32le、utf-32be、"
+                    + "gbk、gb2312、gb18030、big5、shift_jis、euc-jp、euc-kr、latin1。"
+                    + "写 GBK/GB18030 文件必须显式指定 encoding=gb18030；追加写入不会写 BOM"))
             },
             new[] { "path", "content" });
 
@@ -75,6 +80,14 @@ public sealed class FileWriteTools
                 var append = context.GetBool("append");
                 var createParents = context.GetBool("createParents", true);
                 var permissionsText = context.GetString("permissions");
+
+                // 1.0 编码先校验：写入用的编码对未知名是静默回退 UTF-8 的，不校验会写错还不报错
+                var encodingName = _service.ResolveEncodingName(profile, context.GetString("encoding"));
+                var encodingError = RemoteFsService.ValidateEncodingName(encodingName);
+                if (encodingError is not null)
+                {
+                    return ToolResult.Error(encodingError);
+                }
 
                 // 权限值非法必须在写入之前拦下，否则文件已改却返回失败
                 short permissions = 0;
@@ -104,7 +117,18 @@ public sealed class FileWriteTools
                     append = false;
                 }
 
-                RemoteFileWriter.WriteText(sftp, path, content, append);
+                // 编码器是严格模式：目标编码表示不了的字符会抛异常，必须转成能自愈的提示
+                try
+                {
+                    RemoteFileWriter.WriteText(
+                        sftp, path, content, append, TextEncodingResolver.ResolveForWrite(encodingName));
+                }
+                catch (EncoderFallbackException)
+                {
+                    return ToolResult.Error(
+                        $"无法用 {encodingName} 编码写入文件 {path}：文本中包含该编码无法表示的字符。"
+                        + "请改用 encoding=gb18030 或 encoding=utf-8。");
+                }
 
                 // 1.2 写入按需调整权限位，权限值按八进制解析（如 644）
                 if (!string.IsNullOrWhiteSpace(permissionsText))
@@ -133,7 +157,11 @@ public sealed class FileWriteTools
                 ("path", SchemaBuilder.String("远程文件绝对路径")),
                 ("oldText", SchemaBuilder.String("要替换的原文本，必须精确匹配（含缩进与换行）")),
                 ("newText", SchemaBuilder.String("替换后的新文本，可为空字符串表示删除该段")),
-                ("replaceAll", SchemaBuilder.Boolean("是否替换所有匹配项，默认只替换第一处", false))
+                ("replaceAll", SchemaBuilder.Boolean("是否替换所有匹配项，默认只替换第一处", false)),
+                ("encoding", SchemaBuilder.String(
+                    "编辑时使用的文本编码。缺省时保持原文件的编码与 BOM 不变，"
+                    + "但文件不是 UTF-8 时必须显式指定（如 encoding=gb18030），否则会解码失败。"
+                    + "可选值：utf-8、utf-8-bom、gbk、gb18030、utf-16le、utf-16be、big5、shift_jis、latin1 等"))
             },
             new[] { "path", "oldText", "newText" });
 
@@ -172,8 +200,25 @@ public sealed class FileWriteTools
                         + "请改用 remote_exec 配合 sed -i，或 remote_download → 本地修改 → remote_upload。");
                 }
 
-                var text = RemoteFileReader.TryDecodeText(content)
-                    ?? throw new InvalidOperationException($"文件 {path} 是二进制内容，无法做文本替换");
+                var encodingName = _service.ResolveEncodingName(profile, context.GetString("encoding"));
+                var encodingError = RemoteFsService.ValidateEncodingName(encodingName);
+                if (encodingError is not null)
+                {
+                    return ToolResult.Error(encodingError);
+                }
+
+                var decoded = RemoteFileReader.DecodeText(content, encodingName, truncated: false);
+                if (!decoded.Success)
+                {
+                    // 区分「真的是二进制」和「只是编码不对」，后者要给出可自愈的提示
+                    return decoded.IsBinary
+                        ? ToolResult.Error($"文件 {path} 是二进制内容，无法做文本替换")
+                        : ToolResult.Error(
+                            $"文件 {path} 无法按 {decoded.EncodingName} 解码：{decoded.Error}{Environment.NewLine}"
+                            + "该文件很可能使用 GBK/GB18030 等中文编码，请改用 encoding=gb18030 重试。");
+                }
+
+                var text = decoded.Text ?? string.Empty;
 
                 var occurrences = CountOccurrences(text, oldText);
                 if (occurrences == 0)
@@ -195,8 +240,20 @@ public sealed class FileWriteTools
                     ? text.Replace(oldText, newText, StringComparison.Ordinal)
                     : ReplaceFirst(text, oldText, newText);
 
-                // 1.3 原子写入：先写临时文件再重命名，避免写到一半失败损坏原文件
-                RemoteFileWriter.WriteTextAtomic(sftp, path, updated);
+                // 1.3 原子写入：先写临时文件再重命名，避免写到一半失败损坏原文件。
+                // 写回时保持原文件的编码与 BOM，编辑 UTF-8-BOM 文件不能顺手把 BOM 抹掉
+                var (rewriteEncoding, writeBom) =
+                    TextEncodingResolver.ResolveForRewrite(decoded.EncodingName, decoded.HasBom);
+                try
+                {
+                    RemoteFileWriter.WriteTextAtomic(sftp, path, updated, rewriteEncoding, writeBom);
+                }
+                catch (EncoderFallbackException)
+                {
+                    return ToolResult.Error(
+                        $"无法用 {decoded.EncodingName} 编码写回文件 {path}：新文本中包含该编码无法表示的字符。"
+                        + "请改用 encoding=gb18030 或 encoding=utf-8。");
+                }
 
                 var replacedCount = replaceAll ? occurrences : 1;
                 AuditLogger.Info($"编辑文件 [{profile.Name}] {path}，替换 {replacedCount} 处");

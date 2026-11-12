@@ -12,6 +12,7 @@ dist/
 
 # 临时验证目录
 out-gui-check/
+out-enc-check/
 
 # IDE
 .idea/

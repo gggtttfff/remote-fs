@@ -9,6 +9,9 @@ namespace RemoteFs.Gui;
 /// </summary>
 public sealed class HostEditorForm : Form
 {
+    /// <summary>下拉框中「跟随全局配置」这一项的显示文本，其对应的实际编码值为 null</summary>
+    private const string FollowGlobalEncodingText = "（跟随全局配置）";
+
     private readonly ConfigStore _configStore;
     private readonly AppConfig _appConfig;
     private readonly List<HostProfile> _hosts;
@@ -37,6 +40,7 @@ public sealed class HostEditorForm : Form
     private readonly CheckBox _strictHostKeyCheck = new() { Text = "强制校验（指纹不一致时拒绝连接）", AutoSize = true };
     private readonly TextBox _allowedRootsBox = new();
     private readonly NumericUpDown _commandTimeoutBox = new();
+    private readonly ComboBox _encodingCombo = new();
     private readonly TextBox _descriptionBox = new();
     private readonly Label _banner = new();
     private readonly Label _statusLabel = new();
@@ -170,6 +174,9 @@ public sealed class HostEditorForm : Form
         _commandTimeoutBox.Maximum = 600_000;
         _commandTimeoutBox.Increment = 1_000;
         _commandTimeoutBox.Value = 60_000;
+
+        _encodingCombo.DropDownStyle = ComboBoxStyle.DropDownList;
+        RefreshEncodingItems(null);
 
         _authAuto.Checked = true;
         _strictHostKeyCheck.Checked = true;
@@ -331,6 +338,7 @@ public sealed class HostEditorForm : Form
         AddEditorRow(table, string.Empty, _strictHostKeyCheck);
         AddEditorRow(table, "允许根目录", _allowedRootsBox);
         AddEditorRow(table, "命令超时(ms)", _commandTimeoutBox);
+        AddEditorRow(table, "默认编码", _encodingCombo);
         AddEditorRow(table, "备注", _descriptionBox);
 
         scroll.Controls.Add(table);
@@ -482,6 +490,9 @@ public sealed class HostEditorForm : Form
                 case RadioButton radioButton:
                     radioButton.CheckedChanged += MarkDirty;
                     break;
+                case ComboBox comboBox:
+                    comboBox.SelectedIndexChanged += MarkDirty;
+                    break;
             }
         }
     }
@@ -506,6 +517,7 @@ public sealed class HostEditorForm : Form
         yield return _strictHostKeyCheck;
         yield return _allowedRootsBox;
         yield return _commandTimeoutBox;
+        yield return _encodingCombo;
         yield return _descriptionBox;
     }
 
@@ -578,6 +590,58 @@ public sealed class HostEditorForm : Form
         _allowedRootsBox.Text = string.Join(", ", profile.AllowedRoots);
         _commandTimeoutBox.Value = Math.Clamp(profile.CommandTimeoutMilliseconds, 1_000, 600_000);
         _descriptionBox.Text = profile.Description ?? string.Empty;
+
+        RefreshEncodingItems(profile.DefaultEncoding);
+        _encodingCombo.SelectedItem = ResolveEncodingSelection(profile.DefaultEncoding);
+    }
+
+    /// <summary>
+    /// 重建编码下拉框的候选项：跟随全局 + 全部受支持的编码
+    /// </summary>
+    /// <param name="currentEncoding">当前主机配置的编码名，用于补进非标准的候选值</param>
+    private void RefreshEncodingItems(string? currentEncoding)
+    {
+        _encodingCombo.Items.Clear();
+        _encodingCombo.Items.Add(FollowGlobalEncodingText);
+        foreach (var encodingName in TextEncodingResolver.SupportedNames)
+        {
+            _encodingCombo.Items.Add(encodingName);
+        }
+
+        // 兜底：历史配置里的非标准编码名补进候选项，避免保存时被悄悄改写
+        if (!string.IsNullOrWhiteSpace(currentEncoding))
+        {
+            var normalized = TextEncodingResolver.Normalize(currentEncoding);
+            if (!_encodingCombo.Items.Contains(normalized))
+            {
+                _encodingCombo.Items.Add(normalized);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 选出下拉框要显示的项；主机未单独配置编码时显示「跟随全局配置」
+    /// </summary>
+    private static string ResolveEncodingSelection(string? encodingName)
+    {
+        if (string.IsNullOrWhiteSpace(encodingName))
+        {
+            return FollowGlobalEncodingText;
+        }
+        return TextEncodingResolver.Normalize(encodingName);
+    }
+
+    /// <summary>
+    /// 取下拉框对应的实际编码值；「跟随全局配置」对应 null
+    /// </summary>
+    private string? ResolveEncodingValue()
+    {
+        var selected = _encodingCombo.SelectedItem?.ToString();
+        if (string.IsNullOrWhiteSpace(selected) || selected == FollowGlobalEncodingText)
+        {
+            return null;
+        }
+        return TextEncodingResolver.Normalize(selected);
     }
 
     /// <summary>
@@ -602,6 +666,7 @@ public sealed class HostEditorForm : Form
             KnownHostKeyFingerprint = NullIfBlank(_fingerprintBox.Text),
             AllowedRoots = ParseAllowedRoots(_allowedRootsBox.Text),
             CommandTimeoutMilliseconds = (int)_commandTimeoutBox.Value,
+            DefaultEncoding = ResolveEncodingValue(),
             Description = NullIfBlank(_descriptionBox.Text)
         };
     }
@@ -624,6 +689,8 @@ public sealed class HostEditorForm : Form
         _strictHostKeyCheck.Checked = true;
         _allowedRootsBox.Text = string.Empty;
         _commandTimeoutBox.Value = 60_000;
+        RefreshEncodingItems(null);
+        _encodingCombo.SelectedItem = FollowGlobalEncodingText;
         _descriptionBox.Text = string.Empty;
     }
 

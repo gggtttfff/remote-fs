@@ -41,7 +41,8 @@ public sealed class RemoteJobManager : IDisposable
     /// <summary>
     /// 提交任务并返回句柄，不等待命令结束
     /// </summary>
-    public RemoteJobHandle StartJob(HostProfile profile, string command, int ttlSeconds)
+    public RemoteJobHandle StartJob(
+        HostProfile profile, string command, int ttlSeconds, string outputEncoding)
     {
         using var lease = _pool.Acquire(profile);
         var sftp = lease.Client;
@@ -50,7 +51,9 @@ public sealed class RemoteJobManager : IDisposable
         var jobId = BuildJobId();
         var directory = environment.JobRoot + "/" + jobId;
 
-        // 1.1 准备任务目录，写入命令与两个脚本
+        // 1.1 准备任务目录，写入命令与两个脚本。
+        // cmd 会被远端 shell 当字节读，run.sh / watchdog.sh 里也带中文注释，
+        // 三者一律 UTF-8，不跟随配置编码，否则命令本身会被写坏
         RemoteFileWriter.EnsureDirectory(sftp, directory);
         sftp.WriteAllText(directory + "/cmd", command, Utf8NoBom);
         sftp.WriteAllText(
@@ -61,6 +64,9 @@ public sealed class RemoteJobManager : IDisposable
             directory + "/watchdog.sh",
             RemoteJobScripts.BuildWatchdogScript(directory, ttlSeconds),
             Utf8NoBom);
+
+        // 1.2 输出编码随任务留在服务器上：MCP 重启后接管遗留任务时仍知道该用什么解码
+        sftp.WriteAllText(directory + "/encoding", outputEncoding, Utf8NoBom);
 
         // 1.2 启动；脚本自己脱离会话，SSH 通道关闭不会波及它
         var launch = RemoteJobScripts.BuildLaunchCommand(directory, environment.UseSetsid);
@@ -76,7 +82,7 @@ public sealed class RemoteJobManager : IDisposable
         }
 
         var handle = new RemoteJobHandle(
-            profile.Name, jobId, directory, command, DateTime.UtcNow);
+            profile.Name, jobId, directory, command, DateTime.UtcNow, outputEncoding);
         RememberStarted(profile, handle);
 
         AuditLogger.Info(
@@ -136,9 +142,9 @@ public sealed class RemoteJobManager : IDisposable
         {
             var sftp = lease.Client;
             (stdout, var stdoutTruncated) = ReadTextOrEmpty(
-                sftp, handle.RemoteDirectory + "/out", _config.MaxReadBytes);
+                sftp, handle.RemoteDirectory + "/out", _config.MaxReadBytes, handle.OutputEncoding);
             (stderr, var stderrTruncated) = ReadTextOrEmpty(
-                sftp, handle.RemoteDirectory + "/err", _config.MaxReadBytes);
+                sftp, handle.RemoteDirectory + "/err", _config.MaxReadBytes, handle.OutputEncoding);
             truncated = stdoutTruncated || stderrTruncated;
         }
 
@@ -171,13 +177,18 @@ public sealed class RemoteJobManager : IDisposable
     /// </summary>
     public (JobOutputChunk Stdout, JobOutputChunk Stderr, RemoteJobInfo Info) ReadOutput(
         HostProfile profile, RemoteJobHandle handle,
-        long stdoutOffset, long stderrOffset, int maxBytes)
+        long stdoutOffset, long stderrOffset, int maxBytes, string? encodingOverride = null)
     {
         using var lease = _pool.Acquire(profile);
         var sftp = lease.Client;
 
-        var stdout = ReadChunk(sftp, handle.RemoteDirectory + "/out", stdoutOffset, maxBytes);
-        var stderr = ReadChunk(sftp, handle.RemoteDirectory + "/err", stderrOffset, maxBytes);
+        // 输出编码以任务目录里记录的为准，工具参数可以做单次覆盖
+        var encodingName = string.IsNullOrWhiteSpace(encodingOverride)
+            ? handle.OutputEncoding
+            : TextEncodingResolver.Normalize(encodingOverride);
+
+        var stdout = ReadChunk(sftp, handle.RemoteDirectory + "/out", stdoutOffset, maxBytes, encodingName);
+        var stderr = ReadChunk(sftp, handle.RemoteDirectory + "/err", stderrOffset, maxBytes, encodingName);
         var info = BuildStatus(sftp, handle.JobId, handle.RemoteDirectory);
         return (stdout, stderr, info);
     }
@@ -263,7 +274,16 @@ public sealed class RemoteJobManager : IDisposable
         }
 
         var command = TryReadText(sftp, directory + "/cmd") ?? string.Empty;
-        return new RemoteJobHandle(profile.Name, jobId, directory, command, DateTime.UtcNow);
+
+        // 接管遗留任务时把提交时记录的输出编码一并读回来，缺失则按 UTF-8 兜底
+        var outputEncoding = TryReadText(sftp, directory + "/encoding")?.Trim();
+        if (string.IsNullOrWhiteSpace(outputEncoding))
+        {
+            outputEncoding = TextEncodingResolver.Normalize(null);
+        }
+
+        return new RemoteJobHandle(
+            profile.Name, jobId, directory, command, DateTime.UtcNow, outputEncoding);
     }
 
     /// <summary>
@@ -451,7 +471,8 @@ public sealed class RemoteJobManager : IDisposable
     /// <summary>
     /// 增量读取一段输出
     /// </summary>
-    private static JobOutputChunk ReadChunk(SftpClient sftp, string path, long offset, int maxBytes)
+    private static JobOutputChunk ReadChunk(
+        SftpClient sftp, string path, long offset, int maxBytes, string encodingName)
     {
         try
         {
@@ -461,8 +482,12 @@ public sealed class RemoteJobManager : IDisposable
                 return new JobOutputChunk(string.Empty, offset, false);
             }
 
-            var text = RemoteFileReader.TryDecodeText(content, truncated)
-                ?? $"[二进制内容，{content.Length} 字节，无法以文本展示]";
+            var decoded = RemoteFileReader.DecodeText(content, encodingName, truncated);
+            var text = decoded.Success
+                ? decoded.Text ?? string.Empty
+                : decoded.IsBinary
+                    ? $"[二进制内容，{content.Length} 字节，无法以文本展示]"
+                    : $"[无法按 {decoded.EncodingName} 解码，{content.Length} 字节]";
             return new JobOutputChunk(text, offset + content.Length, offset + content.Length < totalLength);
         }
         catch (Exception)
@@ -476,12 +501,13 @@ public sealed class RemoteJobManager : IDisposable
     /// 读取整份输出，超过上限时截断
     /// </summary>
     private static (string Text, bool Truncated) ReadTextOrEmpty(
-        SftpClient sftp, string path, int maxBytes)
+        SftpClient sftp, string path, int maxBytes, string encodingName)
     {
         try
         {
             var (content, _, truncated) = RemoteFileReader.Read(sftp, path, 0, -1, maxBytes);
-            return (RemoteFileReader.TryDecodeText(content, truncated) ?? string.Empty, truncated);
+            var decoded = RemoteFileReader.DecodeText(content, encodingName, truncated);
+            return (decoded.Success ? decoded.Text ?? string.Empty : string.Empty, truncated);
         }
         catch (Exception)
         {

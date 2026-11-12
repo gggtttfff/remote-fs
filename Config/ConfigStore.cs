@@ -84,6 +84,9 @@ public sealed class AppConfig
     /// <summary>目录枚举缓存的有效期（秒），超时后重新枚举</summary>
     public int CacheTtlSeconds { get; set; } = 30;
 
+    /// <summary>默认文本编码（主机未单独指定时生效）。空值按 utf-8 处理</summary>
+    public string? DefaultEncoding { get; set; } = "utf-8";
+
     /// <summary>后台任务的最长运行时间（分钟），到期由远程看护进程强制终止</summary>
     public int BackgroundJobTtlMinutes { get; set; } = 30;
 

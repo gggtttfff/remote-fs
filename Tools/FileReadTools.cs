@@ -123,7 +123,13 @@ public sealed class FileReadTools
                 ("path", SchemaBuilder.String("远程文件绝对路径")),
                 ("offset", SchemaBuilder.Integer("起始字节偏移，用于分页读取大文件", 0)),
                 ("length", SchemaBuilder.Integer("读取字节数，-1 表示读取到文件末尾", -1)),
-                ("maxLines", SchemaBuilder.Integer("最多返回的行数，超出部分截断并提示继续读取的位置", 0))
+                ("maxLines", SchemaBuilder.Integer("最多返回的行数，超出部分截断并提示继续读取的位置", 0)),
+                ("encoding", SchemaBuilder.String(
+                    "文本编码。缺省时按主机配置→全局配置取值（默认 utf-8）。"
+                    + "可选值：auto、utf-8、utf-8-bom、utf-16le、utf-16be、utf-32le、utf-32be、"
+                    + "gbk、gb2312、gb18030、big5、shift_jis、euc-jp、euc-kr、latin1。"
+                    + "文件带 BOM 时以 BOM 为准；未指定且无法按 UTF-8 解码时，"
+                    + "错误信息会提示改用 encoding=gb18030"))
             },
             new[] { "path" });
 
@@ -157,16 +163,25 @@ public sealed class FileReadTools
                     return ToolResult.Ok($"文件 {path} 为空");
                 }
 
-                var text = RemoteFileReader.TryDecodeText(content, truncated);
-                if (text is null)
+                var encodingName = _service.ResolveEncodingName(profile, context.GetString("encoding"));
+                var decoded = RemoteFileReader.DecodeText(content, encodingName, truncated);
+                if (!decoded.Success)
                 {
-                    return ToolResult.Error(
-                        $"文件 {path} 是二进制内容，无法以文本展示（大小 {RemoteFsService.FormatSize(totalLength)}）。"
-                        + "请改用 remote_download 工具下载到本地处理。");
+                    return decoded.IsBinary
+                        ? ToolResult.Error(
+                            $"文件 {path} 是二进制内容，无法以文本展示（大小 {RemoteFsService.FormatSize(totalLength)}）。"
+                            + "请改用 remote_download 工具下载到本地处理。")
+                        : ToolResult.Error(BuildEncodingError(path, decoded));
                 }
 
+                var text = decoded.Text ?? string.Empty;
+
                 var builder = new StringBuilder();
-                builder.AppendLine($"文件 {path}（主机 {profile.Name}，共 {totalLength} 字节）");
+                // 把实际用的编码写进头部，模型下次就知道该怎么指定
+                var bomNote = decoded.HasBom ? "，带 BOM" : string.Empty;
+                builder.AppendLine(
+                    $"文件 {path}（主机 {profile.Name}，共 {totalLength} 字节，"
+                    + $"编码 {decoded.EncodingName}{bomNote}）");
 
                 var lines = text.Split('\n');
                 var lineLimit = maxLines > 0 ? Math.Min(maxLines, lines.Length) : lines.Length;
@@ -266,7 +281,11 @@ public sealed class FileReadTools
                 ("filePattern", SchemaBuilder.String("文件名过滤的通配符，如 *.conf，默认匹配所有文件")),
                 ("caseSensitive", SchemaBuilder.Boolean("是否区分大小写", false)),
                 ("maxResults", SchemaBuilder.Integer("最大返回结果条数，受全局 maxSearchResults 上限约束", 50)),
-                ("recursive", SchemaBuilder.Boolean("是否递归搜索子目录", true))
+                ("recursive", SchemaBuilder.Boolean("是否递归搜索子目录", true)),
+                ("encoding", SchemaBuilder.String(
+                    "搜索时用于解码的文本编码。缺省时按主机配置→全局配置取值（默认 utf-8）。"
+                    + "在 GBK/GB18030 目录里搜索中文时必须显式指定 encoding=gb18030。"
+                    + "可选值：auto、utf-8、utf-8-bom、gbk、gb2312、gb18030、big5、shift_jis、euc-jp、euc-kr、latin1"))
             },
             new[] { "path", "pattern" });
 
@@ -297,6 +316,7 @@ public sealed class FileReadTools
                 var comparison = caseSensitive
                     ? StringComparison.Ordinal
                     : StringComparison.OrdinalIgnoreCase;
+                var encodingName = _service.ResolveEncodingName(profile, context.GetString("encoding"));
 
                 var builder = new StringBuilder();
                 var matchCount = 0;
@@ -315,7 +335,7 @@ public sealed class FileReadTools
                     {
                         // 流式按行读取，避免整份文件进内存
                         foreach (var (number, line) in RemoteFileReader.ReadLines(
-                                     sftp, file, _service.Config.MaxReadBytes, 200_000))
+                                     sftp, file, _service.Config.MaxReadBytes, 200_000, encodingName))
                         {
                             if (!line.Contains(pattern, comparison))
                             {
@@ -566,6 +586,16 @@ public sealed class FileReadTools
 
             yield return entry.FullName;
         }
+    }
+
+    /// <summary>
+    /// 解码失败时的提示。要点明可能的中文编码，让调用方能自愈
+    /// </summary>
+    private static string BuildEncodingError(string path, DecodeOutcome decoded)
+    {
+        return $"文件 {path} 无法按 {decoded.EncodingName} 解码：{decoded.Error}{Environment.NewLine}"
+            + "该文件很可能使用 GBK/GB18030 等中文编码，请改用 encoding=gb18030 重试；"
+            + "若确为二进制内容，请改用 remote_download 下载到本地处理。";
     }
 
     /// <summary>

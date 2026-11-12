@@ -23,6 +23,7 @@ public sealed class ConfigTab : UserControl
     private readonly NumericUpDown _sftpOperationTimeoutBox = new();
     private readonly NumericUpDown _connectionIdleSecondsBox = new();
     private readonly ComboBox _remoteExecPolicyCombo = new();
+    private readonly ComboBox _defaultEncodingCombo = new();
     private readonly CheckBox _followSymbolicLinksCheckBox = new();
     private readonly CheckBox _cacheEnabledCheckBox = new();
     private readonly NumericUpDown _cacheTtlSecondsBox = new();
@@ -112,6 +113,15 @@ public sealed class ConfigTab : UserControl
             "remote_tree 的深度上限");
         AddRow(table, "搜索结果条数上限", CreateNumberBox(_maxSearchResultsBox, 1, 100_000),
             "remote_search 最多返回的匹配条数");
+
+        _defaultEncodingCombo.DropDownStyle = ComboBoxStyle.DropDownList;
+        _defaultEncodingCombo.Width = 180;
+        foreach (var encodingName in TextEncodingResolver.SupportedNames)
+        {
+            _defaultEncodingCombo.Items.Add(encodingName);
+        }
+        AddRow(table, "默认编码", _defaultEncodingCombo,
+            "文件读写与搜索使用的默认文本编码。服务器上的文件是 GBK/GB18030 时应设为 gb18030");
 
         // 3. 连接
         AddSectionTitle(table, "连接");
@@ -291,6 +301,7 @@ public sealed class ConfigTab : UserControl
         _maxListEntriesBox.Value = Math.Clamp(config.MaxListEntries, 10, 1_000_000);
         _maxTreeDepthBox.Value = Math.Clamp(config.MaxTreeDepth, 1, 100);
         _maxSearchResultsBox.Value = Math.Clamp(config.MaxSearchResults, 1, 100_000);
+        _defaultEncodingCombo.SelectedItem = ResolveEncodingSelection(config.DefaultEncoding);
         _connectionTimeoutBox.Value = Math.Clamp(config.ConnectionTimeoutMilliseconds, 1000, 600_000);
         _sftpOperationTimeoutBox.Value = Math.Clamp(config.SftpOperationTimeoutMilliseconds, 1000, 600_000);
         _connectionIdleSecondsBox.Value = Math.Clamp(config.ConnectionIdleSeconds, 10, 86_400);
@@ -310,6 +321,17 @@ public sealed class ConfigTab : UserControl
             $"配置目录：{ConfigStore.ConfigDirectory}{Environment.NewLine}"
             + $"缓存目录：{ConfigStore.CacheDirectory}{Environment.NewLine}"
             + $"日志目录：{LogFileWriter.DefaultDirectory}";
+    }
+
+    /// <summary>
+    /// 选出下拉框要显示的编码名；配置里的值不在候选列表时回退到 auto
+    /// </summary>
+    private static string ResolveEncodingSelection(string? encodingName)
+    {
+        var normalized = TextEncodingResolver.Normalize(encodingName);
+        return TextEncodingResolver.SupportedNames.Contains(normalized)
+            ? normalized
+            : TextEncodingResolver.Normalize(null);
     }
 
     /// <summary>
@@ -333,6 +355,7 @@ public sealed class ConfigTab : UserControl
             config.ConnectionTimeoutMilliseconds = (int)_connectionTimeoutBox.Value;
             config.SftpOperationTimeoutMilliseconds = (int)_sftpOperationTimeoutBox.Value;
             config.ConnectionIdleSeconds = (int)_connectionIdleSecondsBox.Value;
+            config.DefaultEncoding = _defaultEncodingCombo.SelectedItem?.ToString();
 
             if (Enum.TryParse<RemoteExecPolicy>(_remoteExecPolicyCombo.SelectedItem?.ToString(), out var policy))
             {

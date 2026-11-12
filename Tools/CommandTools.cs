@@ -49,7 +49,11 @@ public sealed class CommandTools
                 ("background", SchemaBuilder.Boolean(
                     "是否后台运行。开启后立即返回任务编号，用 remote_job_status 增量查看输出", false)),
                 ("ttlMinutes", SchemaBuilder.Integer(
-                    "后台任务的最长运行分钟数，到期由远程看护进程强制终止；默认取全局配置", 1, 1_440))
+                    "后台任务的最长运行分钟数，到期由远程看护进程强制终止；默认取全局配置", 1, 1_440)),
+                ("encoding", SchemaBuilder.String(
+                    "解码命令输出的文本编码。缺省时按主机配置→全局配置取值（默认 utf-8）。"
+                    + "注意：命令本身始终以 UTF-8 下发到服务器，此参数只影响 stdout/stderr 的解码。"
+                    + "可选值：utf-8、gbk、gb18030、big5、shift_jis、latin1 等"))
             },
             new[] { "command" });
 
@@ -75,10 +79,18 @@ public sealed class CommandTools
                 // 命令中引用的绝对路径同样受白名单约束，避免绕过文件工具的限制
                 _service.EnsureCommandAllowed(profile, command);
 
+                // 1.0 输出编码先校验，非法值不该等到任务跑完才暴露
+                var outputEncoding = _service.ResolveEncodingName(profile, context.GetString("encoding"));
+                var encodingError = RemoteFsService.ValidateEncodingName(outputEncoding);
+                if (encodingError is not null)
+                {
+                    return ToolResult.Error(encodingError);
+                }
+
                 // 1.1 后台任务必须有兜底时限，否则提交完忘了就会漏跑
                 var ttlSeconds = Math.Clamp(
                     (ttlMinutes ?? _service.Config.BackgroundJobTtlMinutes) * 60, 60, 86_400);
-                var handle = _service.Jobs.StartJob(profile, command, ttlSeconds);
+                var handle = _service.Jobs.StartJob(profile, command, ttlSeconds, outputEncoding);
 
                 // 2.1 后台模式立即返回，让调用方自己轮询
                 if (background)
@@ -177,48 +189,70 @@ public sealed class CommandTools
         return new ToolDefinition
         {
             Name = "remote_test_connection",
-            Description = "测试与远程主机的 SSH 连接是否正常，返回延迟、主机密钥指纹和系统信息。"
-                + "该工具不做指纹比对，可用于在固化指纹之前确认服务器实际指纹。",
+            Description = "逐层诊断与远程主机的连接：DNS、TCP 端口、SSH 握手、主机密钥指纹、认证。"
+                + "通过时返回延迟、服务器版本与指纹；失败时指出卡在哪一层并给出处置建议。",
             InputSchema = schema,
             Annotations = ToolAnnotations.ReadOnly,
             Handler = context =>
             {
                 var profile = _service.ResolveHost(context.GetString("host"));
 
-                // 用放宽指纹校验的副本连接，否则「还没固化指纹」会让测试本身失败
-                var probeProfile = HostKeyValidator.CreateProbeProfile(profile);
-
-                var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-                using var client = _service.OpenSsh(probeProfile, out var fingerprint);
-                stopwatch.Stop();
+                // 逐层探测会真的建一次连接，但用的是放宽指纹校验的副本，
+                // 否则「还没固化指纹」会让测试本身失败
+                var results = ConnectionDiagnostics.Probe(profile);
 
                 var builder = new StringBuilder();
-                builder.AppendLine($"连接成功: {profile.Username}@{profile.Host}:{profile.Port}");
-                builder.AppendLine($"握手耗时: {stopwatch.ElapsedMilliseconds} 毫秒");
-                builder.AppendLine($"服务器版本: {client.ConnectionInfo.ServerVersion}");
-                builder.AppendLine($"主机密钥指纹: {fingerprint}");
+                builder.AppendLine($"诊断目标: {profile.Username}@{profile.Host}:{profile.Port}（主机 {profile.Name}）");
 
-                // 1.1 与已固化的指纹比对，方便发现服务器重装或中间人
-                if (string.IsNullOrWhiteSpace(profile.KnownHostKeyFingerprint))
+                foreach (var result in results)
                 {
-                    builder.AppendLine("指纹固定: 未配置 knownHostKeyFingerprint");
-                }
-                else if (string.Equals(
-                             SshConnectionFactory.NormalizeFingerprint(profile.KnownHostKeyFingerprint),
-                             SshConnectionFactory.NormalizeFingerprint(fingerprint),
-                             StringComparison.Ordinal))
-                {
-                    builder.AppendLine("指纹固定: 与配置一致");
-                }
-                else
-                {
-                    builder.AppendLine(
-                        $"指纹固定: 与配置不一致！配置为 {profile.KnownHostKeyFingerprint}，本次实际为 {fingerprint}");
+                    var outcome = DescribeDiagnosticOutcome(result);
+                    builder.AppendLine($"[{outcome}] {DescribeDiagnosticStage(result.Stage)}: {result.Detail}");
+                    if (string.Equals(outcome, "失败", StringComparison.Ordinal)
+                        && !string.IsNullOrWhiteSpace(result.Advice))
+                    {
+                        builder.AppendLine($"    建议: {result.Advice}");
+                    }
+                    if (!string.IsNullOrWhiteSpace(result.Suggestion))
+                    {
+                        builder.AppendLine($"    {result.Suggestion}");
+                    }
                 }
 
-                return ToolResult.Ok(builder.ToString());
+                var text = _service.TruncateOutput(builder.ToString());
+                return results.All(result => result.Passed)
+                    ? ToolResult.Ok(text)
+                    : ToolResult.Error(text);
             }
         };
+    }
+
+    /// <summary>
+    /// 诊断层次的展示名
+    /// </summary>
+    private static string DescribeDiagnosticStage(DiagnosticStage stage)
+    {
+        return stage switch
+        {
+            DiagnosticStage.Dns => "DNS 解析",
+            DiagnosticStage.Tcp => "TCP 端口",
+            DiagnosticStage.Banner => "SSH 握手",
+            DiagnosticStage.HostKey => "主机密钥",
+            DiagnosticStage.Authentication => "用户认证",
+            _ => "未知环节"
+        };
+    }
+
+    /// <summary>
+    /// 单层结论：通过 / 失败 / 跳过
+    /// </summary>
+    private static string DescribeDiagnosticOutcome(DiagnosticResult result)
+    {
+        if (result.Passed)
+        {
+            return "通过";
+        }
+        return result.Detail.StartsWith("跳过", StringComparison.Ordinal) ? "跳过" : "失败";
     }
 
     /// <summary>

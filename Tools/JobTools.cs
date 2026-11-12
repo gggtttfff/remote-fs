@@ -50,7 +50,10 @@ public sealed class JobTools
                     "标准输出的起始字节偏移，用上次返回的 nextStdoutOffset 继续读取", 0, int.MaxValue)),
                 ("stderrOffset", SchemaBuilder.Integer(
                     "标准错误的起始字节偏移，用上次返回的 nextStderrOffset 继续读取", 0, int.MaxValue)),
-                ("maxBytes", SchemaBuilder.Integer("本次最多返回的字节数，默认 65536", 1024, 1_048_576))
+                ("maxBytes", SchemaBuilder.Integer("本次最多返回的字节数，默认 65536", 1024, 1_048_576)),
+                ("encoding", SchemaBuilder.String(
+                    "解码任务输出的文本编码。缺省时使用任务提交时记录的编码，"
+                    + "再回落到主机配置→全局配置。可选值：utf-8、gbk、gb18030、big5、latin1 等"))
             },
             new[] { "jobId" });
 
@@ -80,7 +83,8 @@ public sealed class JobTools
                 }
 
                 var (stdout, stderr, info) = _service.Jobs.ReadOutput(
-                    profile, handle, stdoutOffset, stderrOffset, maxBytes);
+                    profile, handle, stdoutOffset, stderrOffset, maxBytes,
+                    context.GetString("encoding"));
 
                 return ToolResult.Ok(_service.TruncateOutput(FormatStatus(info, stdout, stderr)));
             }

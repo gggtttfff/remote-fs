@@ -29,7 +29,8 @@ public sealed record RemoteJobHandle(
     string JobId,
     string RemoteDirectory,
     string Command,
-    DateTime StartedAtUtc);
+    DateTime StartedAtUtc,
+    string OutputEncoding = "utf-8");
 
 /// <summary>
 /// 任务快照，供状态查询与列表展示
