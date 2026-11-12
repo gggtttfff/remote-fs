@@ -19,9 +19,9 @@ public sealed class HostEditorForm : Form
 
     // 左侧列表
     private readonly ListBox _hostList = new();
-    private readonly Button _addButton = new() { Text = "添加" };
-    private readonly Button _importButton = new() { Text = "从 ssh_config 导入" };
-    private readonly Button _removeButton = new() { Text = "删除" };
+    private readonly Button _addButton = new() { Text = "添加", AutoSize = true };
+    private readonly Button _importButton = new() { Text = "从 ssh_config 导入", AutoSize = true };
+    private readonly Button _removeButton = new() { Text = "删除", AutoSize = true };
 
     // 右侧编辑区
     private readonly TextBox _nameBox = new();
@@ -959,14 +959,26 @@ public sealed class HostEditorForm : Form
     {
         try
         {
+            // 导入后要重新从磁盘加载，当前未保存的修改会丢，先给一次保存机会
+            if (!TryLeaveCurrent())
+            {
+                return;
+            }
+
             using var dialog = new SshConfigImportDialog(_configStore);
             if (dialog.ShowDialog(this) != DialogResult.OK)
             {
                 return;
             }
 
+            // 导入对话框直接写的是 hosts.json，内存里的 _hosts 还是打开界面时的旧快照，
+            // 不重新加载的话表现就是「导入成功但列表没变化」
+            var reloaded = _configStore.LoadHosts();
+            _hosts.Clear();
+            _hosts.AddRange(reloaded);
+            _currentIndex = -1;
             RebuildHostList(0);
-            SetStatus("已从 ssh_config 导入主机");
+            SetStatus($"已从 ssh_config 导入主机，当前共 {_hosts.Count} 台");
         }
         catch (Exception exception)
         {

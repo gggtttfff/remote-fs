@@ -143,9 +143,9 @@ public sealed class LogSettingsTab : UserControl
 
         panel.Controls.Add(new Label { Text = "日志目录", AutoSize = true, Margin = new Padding(3, 8, 3, 3) }, 0, 0);
 
-        _directoryLabel.Dock = DockStyle.Fill;
-        _directoryLabel.AutoSize = false;
-        _directoryLabel.Height = 22;
+        // 路径可能比这一列还长，允许换行显示，别直接裁掉
+        _directoryLabel.AutoSize = true;
+        _directoryLabel.MaximumSize = new Size(420, 0);
         _directoryLabel.Margin = new Padding(3, 4, 3, 3);
         panel.Controls.Add(_directoryLabel, 1, 0);
 

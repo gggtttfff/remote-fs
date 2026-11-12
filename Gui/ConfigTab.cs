@@ -157,9 +157,10 @@ public sealed class ConfigTab : UserControl
 
         // 7. 路径说明
         AddSectionTitle(table, "数据位置");
-        _pathsLabel.Dock = DockStyle.Fill;
-        _pathsLabel.AutoSize = false;
-        _pathsLabel.Height = 46;
+        // 三个路径分三行，固定高度会把最后一行裁掉；交给 AutoSize 撑开，
+        // 限制最大宽度是为了长路径换行而不是把表格撑宽
+        _pathsLabel.AutoSize = true;
+        _pathsLabel.MaximumSize = new Size(520, 0);
         _pathsLabel.Margin = new Padding(3, 4, 3, 4);
         table.Controls.Add(_pathsLabel, 1, table.RowCount);
         table.RowCount++;
