@@ -1,5 +1,4 @@
 using System.Text;
-using System.Text.Json;
 
 namespace RemoteFs.Logging;
 
@@ -28,12 +27,14 @@ public sealed class LogFileReader
         {
             if (!File.Exists(_activeFilePath))
             {
+                _position = 0;
+                _pendingFragment = null;
                 return entries;
             }
 
+            _pendingFragment = null;
             var fileLength = new FileInfo(_activeFilePath).Length;
             var start = Math.Max(0, fileLength - maxBytes);
-            _position = start;
 
             using var stream = new FileStream(
                 _activeFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
@@ -47,12 +48,29 @@ public sealed class LogFileReader
                 text.Append(Encoding.UTF8.GetString(buffer, 0, read));
             }
 
+            // 读过的字节不能再当新日志。位置停在开头的话，界面第一次刷新会把历史整段再追加一遍
+            _position = stream.Position;
+
             // 1. 尾部截断可能导致第一行不完整，丢弃
             var content = text.ToString();
             var firstNewline = content.IndexOf('\n');
             if (firstNewline >= 0 && start > 0)
             {
                 content = content[(firstNewline + 1)..];
+            }
+
+            // 2. 末尾若是半行，留给下次增量读取拼接，这次不解析
+            var lastNewline = content.LastIndexOf('\n');
+            if (lastNewline < 0)
+            {
+                _pendingFragment = content.Length == 0 ? null : content;
+                return entries;
+            }
+
+            if (lastNewline < content.Length - 1)
+            {
+                _pendingFragment = content[(lastNewline + 1)..];
+                content = content[..(lastNewline + 1)];
             }
 
             foreach (var entry in ParseLines(content))

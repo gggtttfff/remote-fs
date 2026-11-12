@@ -16,9 +16,9 @@ public sealed class LogSettingsTab : UserControl
     private readonly ComboBox _levelCombo = new();
     private readonly CheckBox _recordPayloadsCheckBox = new();
     private readonly CheckBox _traceToolTimingCheckBox = new();
-    private readonly NumericUpDown _maxFileSizeBox = new();
-    private readonly NumericUpDown _retentionDaysBox = new();
-    private readonly NumericUpDown _maxFilesBox = new();
+    private readonly NumericUpDown _maxFileSizeBox = new NoWheelNumericUpDown();
+    private readonly NumericUpDown _retentionDaysBox = new NoWheelNumericUpDown();
+    private readonly NumericUpDown _maxFilesBox = new NoWheelNumericUpDown();
     private readonly Label _directoryLabel = new();
     private readonly Label _statusLabel = new();
 
