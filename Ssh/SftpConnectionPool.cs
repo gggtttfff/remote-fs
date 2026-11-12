@@ -80,6 +80,23 @@ public sealed class SftpConnectionPool : IDisposable
         }
     }
 
+    /// <summary>
+    /// 丢弃全部连接。主机配置变更后调用：
+    /// 被删除的主机不能靠池里的活连接继续用，连接参数改过的主机也不能沿用旧连接
+    /// </summary>
+    public int InvalidateAll()
+    {
+        lock (_syncRoot)
+        {
+            var count = _connections.Count;
+            foreach (var hostName in _connections.Keys.ToList())
+            {
+                DisposeEntry(hostName, _connections[hostName]);
+            }
+            return count;
+        }
+    }
+
     private void DisposeEntry(string hostName, PooledConnection entry)
     {
         _connections.Remove(hostName);

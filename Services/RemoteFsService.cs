@@ -20,6 +20,9 @@ public sealed class RemoteFsService : IDisposable
     private readonly List<HostProfile> _hostCache;
     private readonly RemoteJobManager _jobManager;
 
+    /// <summary>hosts.json 的变更戳（修改时间与长度混合）。变了就重读配置并丢弃旧连接</summary>
+    private long _hostsFileStamp;
+
     public RemoteFsService(AppConfig config, ConfigStore configStore)
     {
         _config = config;
@@ -30,6 +33,7 @@ public sealed class RemoteFsService : IDisposable
         _cacheStore = new Cache.CacheStore(config);
         _cacheStore.Initialize();
         _hostCache = configStore.LoadHosts();
+        _hostsFileStamp = ReadHostsFileStamp();
         _jobManager = new RemoteJobManager(config, _connectionFactory, _sftpPool);
     }
 
@@ -61,20 +65,64 @@ public sealed class RemoteFsService : IDisposable
     /// </summary>
     public HostProfile ResolveHost(string? hostName)
     {
+        // 1.1 配置文件改过就先重读：新增、删除、改连接参数都要立刻生效。
+        // MCP 服务是常驻进程，不能要求用户重启客户端
+        var justReloaded = RefreshHostCacheIfChanged();
+
         var name = ResolveHostName(hostName);
 
-        // 1.1 先走内存缓存，避免每次调用都读盘
+        // 1.2 再看缓存；刚才没重读过而这里又没命中，才需要再读一次兜底
         try
         {
             return _configStore.RequireHost(name, _hostCache);
         }
         catch (KeyNotFoundException)
         {
-            // 1.2 没命中就重读一次：
-            // MCP 服务是常驻进程，用户在 GUI 里新增的主机不能要求重启客户端才生效
-            RefreshHostCache();
+            if (!justReloaded)
+            {
+                RefreshHostCache();
+            }
             return _configStore.RequireHost(name, _hostCache);
         }
+    }
+
+    /// <summary>
+    /// 读 hosts.json 的变更戳：修改时间与长度混合，任一变化都算配置变了
+    /// </summary>
+    private long ReadHostsFileStamp()
+    {
+        try
+        {
+            var info = new FileInfo(_configStore.HostsFilePath);
+            return info.Exists ? info.LastWriteTimeUtc.Ticks ^ info.Length : 0;
+        }
+        catch (Exception exception)
+        {
+            // 读不到状态就返回 -1，调用方沿用现有缓存，不要让所有工具一起不可用
+            AuditLogger.Warn($"读取主机配置文件状态失败: {exception.Message}");
+            return -1;
+        }
+    }
+
+    /// <summary>
+    /// 配置文件变了才重读，避免每次工具调用都读盘。
+    /// 返回是否真的重读过，调用方据此决定还要不要兜底重读
+    /// </summary>
+    private bool RefreshHostCacheIfChanged()
+    {
+        var stamp = ReadHostsFileStamp();
+        if (stamp < 0 || stamp == _hostsFileStamp)
+        {
+            return false;
+        }
+
+        if (!RefreshHostCache())
+        {
+            return false;
+        }
+
+        _hostsFileStamp = stamp;
+        return true;
     }
 
     /// <summary>
@@ -98,20 +146,26 @@ public sealed class RemoteFsService : IDisposable
     /// <summary>
     /// 重新读取主机配置文件
     /// </summary>
-    private void RefreshHostCache()
+    private bool RefreshHostCache()
     {
         try
         {
             var reloaded = _configStore.LoadHosts();
             _hostCache.Clear();
             _hostCache.AddRange(reloaded);
-            AuditLogger.Info($"工具调用未命中主机缓存，已重新读取主机配置，共 {reloaded.Count} 台");
+
+            // 配置变了：被删除的主机不能靠池里的活连接继续用，连接参数改过的也不能沿用旧连接
+            var dropped = _sftpPool.InvalidateAll();
+            AuditLogger.Info(
+                $"主机配置已变更，重新读取到 {reloaded.Count} 台主机，丢弃 {dropped} 条旧连接");
+            return true;
         }
         catch (Exception exception)
         {
             // 配置文件损坏时保留旧缓存，不要让所有工具一起不可用
             AuditLogger.Warn(
                 $"重新读取主机配置失败，继续使用内存中的 {_hostCache.Count} 台主机: {exception.Message}");
+            return false;
         }
     }
 
