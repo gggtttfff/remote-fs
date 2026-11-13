@@ -20,7 +20,7 @@ AI 改远程配置、看日志、在服务器上编译，一次对话里会连�
 
 ### 文件
 
-22 个 MCP 工具，`host` 省略时用全局默认主机。
+23 个 MCP 工具，`host` 省略时用全局默认主机。
 
 - 浏览：`remote_ls`、`remote_tree`、`remote_stat`、`remote_search`
 - 读取：`remote_read_file` 带行号，按 `offset` 分页；二进制内容拒绝当文本读，改走下载
@@ -45,7 +45,7 @@ AI 改远程配置、看日志、在服务器上编译，一次对话里会连�
 ### 安全
 
 - 每台主机一份路径白名单。全局可再强制「没配白名单的主机拒绝一切路径」
-- 白名单生效时拒绝操作软链接，避免路径看起来合法、实际指向范围外
+- 白名单生效时拒绝操作软链接，路径本身或任一上级目录是软链接都会被拦下，避免路径看起来合法、实际指向范围外
 - 主机密钥按 SHA256 指纹校验。开了强校验却没填指纹时直接拒绝连接，避免「以为校验了其实没校验」
 - `remote_exec` 的路径检查是尽力而为：能拦住命令里写明的越界绝对路径和相对 `..`，拦不住变量拼接、命令替换。需要严格隔离时把 `remoteExecPolicy` 设为 `Deny`
 - 单次输出超过上限会截断并提示，避免一次结果撑满模型上下文
@@ -156,7 +156,7 @@ remote-fs gui
 | 主机配置 | 主机增删改、从 ssh_config 导入、指纹探测、连接测试、生成 MCP 配置片段 |
 | 日志 | 实时日志，等级/关键词/失败过滤、底部跟随、详情复制 |
 | 日志设置 | 日志等级、是否记录出入参、轮转与保留、清空日志 |
-| 配置 | 默认主机、白名单、读写上限、超时、命令策略、软链接、目录缓存、后台任务时限与保留、关闭窗口时驻留托盘、开机启动 |
+| 配置 | 默认主机、白名单、本地允许目录、读写上限、超时、命令策略、软链接、目录缓存、后台任务时限与保留、退出时终止任务、关闭窗口时驻留托盘、开机启动 |
 
 「关闭窗口时驻留后台」开启后，点关闭只收进托盘，从托盘菜单选退出才结束进程。开机启动写入当前用户的 Run 注册表项，以注册表为准。
 
@@ -166,7 +166,7 @@ Linux / macOS 没有图形界面，用上面的 `hosts` 与 `config` 子命令�
 
 文件读写默认走 SSH。主机把 `agentFirst` 设为 `true` 时，直接走备用端口，不再尝试 SSH。没开这个开关时，SSH 在连接阶段失败后的 10 分钟内也不再尝试 SSH，时间过了会再探一次。认证失败和指纹不符不会切换，也不会记入这 10 分钟。
 
-备用端口跑在 **Linux 服务器本机**，直接改本机文件，不经过 SFTP。同一条 TCP 连接会连续承接多次调用。目前承接 `remote_read_file`、`remote_write_file`、`remote_edit_file`、`remote_patch`、`remote_ls`、`remote_stat`、`remote_mkdir`、`remote_remove`。命令、上传下载和后台任务仍然只走 SSH。
+备用端口跑在 **Linux 服务器本机**，直接改本机文件，不经过 SFTP。同一条 TCP 连接会连续承接多次调用。目前承接全部文件工具（读写、按行替换、列举、搜索、目录树、创建、删除、移动、复制、改权限、建链接），以及 `remote_exec` 和任务查询/终止。上传下载仍然只走 SSH。
 
 服务器上：
 
@@ -270,11 +270,13 @@ remote-fs listen --install-service --port 43336
   "connectionIdleSeconds": 300,
   "remoteExecPolicy": "Guard",
   "followSymbolicLinks": false,
+  "localRoots": [],
   "cacheEnabled": true,
   "cacheTtlSeconds": 30,
   "backgroundJobTtlMinutes": 30,
   "jobRetentionDays": 7,
   "jobMaxCount": 50,
+  "killJobsOnExit": true,
   "stayInBackgroundOnExit": false,
   "agentListenPort": 43336,
   "agentAllowedRoots": ["/var/www"]
@@ -287,11 +289,13 @@ remote-fs listen --install-service --port 43336
 | `maxReadBytes` | 单文件读取上限，默认 1MB。超过后 `remote_edit_file` 拒绝编辑 |
 | `maxOutputCharacters` | 单次工具输出的字符上限，超出截断 |
 | `remoteExecPolicy` | `Guard`（默认，拦截命令中写明的越界路径）/ `Allow` / `Deny`（禁用 `remote_exec`） |
-| `followSymbolicLinks` | 默认 `false`。白名单生效时拒绝软链接 |
+| `followSymbolicLinks` | 默认 `false`。白名单生效时，路径本身或其任一上级目录是软链接都会被拒绝 |
+| `localRoots` | 上传下载能触碰的本机目录。为空表示不限制，此时可以上传任意本地文件、覆盖任意本地路径。建议至少配置成工作目录 |
 | `connectionIdleSeconds` | SFTP 连接空闲多久后回收，期间复用同一条连接 |
 | `cacheEnabled` / `cacheTtlSeconds` | 目录列举缓存。默认开启，30 秒过期 |
 | `backgroundJobTtlMinutes` | 后台任务默认时限，默认 30 分钟。单次调用可用 `ttlMinutes` 覆盖 |
 | `jobRetentionDays` / `jobMaxCount` | 远端已结束任务的保留天数，以及每台主机最多保留多少条 |
+| `killJobsOnExit` | 默认 `true`，MCP 退出时终止它启动的远程任务。设为 `false` 后任务在服务器上继续跑，下次启动可用 `remote_job_list` 接管 |
 | `stayInBackgroundOnExit` | 仅 Windows 图形界面：关闭主窗口时收进托盘 |
 | `agentListenPort` | 服务器上 `remote-fs listen` 未指定 `--port` 时使用的端口。0 表示用默认 43336 |
 | `agentAuthorizedKeysPath` | 验签用的公钥文件。空则使用运行用户的 `~/.ssh/authorized_keys` |
