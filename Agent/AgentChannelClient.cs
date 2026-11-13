@@ -1,4 +1,3 @@
-using System.Net.Sockets;
 using System.Text.Json.Nodes;
 using RemoteFs.Common;
 using RemoteFs.Config;
@@ -26,25 +25,34 @@ public static class AgentChannelClient
             return null;
         }
 
-        var token = profile.ResolveAgentToken();
-        if (string.IsNullOrEmpty(token))
+        if (string.IsNullOrWhiteSpace(profile.PrivateKeyPath))
         {
             return ToolResult.Error(
                 $"{unavailable.Message}{Environment.NewLine}"
-                + $"主机 {profile.Name} 已配置备用端口 {profile.AgentPort}，但没有令牌。"
-                + "请填写 agentToken，或设置 agentTokenEnvironmentVariable。");
+                + $"主机 {profile.Name} 已配置备用端口 {profile.AgentPort}，但没有私钥。"
+                + "备用通道使用主机配置里的私钥路径签名。");
         }
 
         try
         {
-            AuditLogger.Warn(
-                $"SSH 不可用 [{profile.Name}]，改走备用端口 {profile.AgentPort} 执行 {toolName}");
-            var result = Invoke(profile, token, toolName, arguments);
+            var route = $"[{profile.Name}] 备用端口 {profile.AgentPort} 执行 {toolName}";
+            if (unavailable.AlreadyKnown)
+            {
+                AuditLogger.Debug(route);
+            }
+            else
+            {
+                AuditLogger.Warn($"SSH 不可用，改走{route}");
+            }
+
+            var result = AgentConnectionPool.Send(profile, toolName, arguments);
             if (result.Ok)
             {
-                return ToolResult.Ok(
-                    result.Text
-                    + $"{Environment.NewLine}（SSH 不可用，已通过端口 {profile.AgentPort} 完成本次操作）");
+                // agentFirst 或冷却期内本来就不尝试 SSH，说成「SSH 不可用」会误导
+                var note = unavailable.AlreadyKnown
+                    ? $"（已通过备用端口 {profile.AgentPort} 完成本次操作）"
+                    : $"（SSH 不可用，已通过备用端口 {profile.AgentPort} 完成本次操作）";
+                return ToolResult.Ok(result.Text + Environment.NewLine + note);
             }
 
             return ToolResult.Error($"经端口 {profile.AgentPort}: {result.Text}");
@@ -58,37 +66,4 @@ public static class AgentChannelClient
         }
     }
 
-    private static (bool Ok, string Text) Invoke(
-        HostProfile profile, string token, string toolName, JsonObject arguments)
-    {
-        using var client = new TcpClient { NoDelay = true };
-        var timeout = TimeSpan.FromMilliseconds(Math.Max(profile.CommandTimeoutMilliseconds, 30_000));
-        using var cancellation = new CancellationTokenSource(timeout);
-        client.ConnectAsync(profile.Host, profile.AgentPort, cancellation.Token)
-            .GetAwaiter()
-            .GetResult();
-
-        using var stream = client.GetStream();
-        var request = new JsonObject
-        {
-            ["token"] = token,
-            ["tool"] = toolName,
-            ["arguments"] = arguments.DeepClone()
-        };
-        AgentFrame.WriteAsync(stream, request.ToJsonString(), cancellation.Token)
-            .GetAwaiter()
-            .GetResult();
-
-        var responseJson = AgentFrame.ReadAsync(stream, cancellation.Token).GetAwaiter().GetResult();
-        if (string.IsNullOrWhiteSpace(responseJson))
-        {
-            throw new IOException("备用端口没有返回结果");
-        }
-
-        var response = JsonNode.Parse(responseJson) as JsonObject
-            ?? throw new InvalidOperationException("备用端口返回的不是 JSON 对象");
-        var ok = response["ok"]?.GetValue<bool>() ?? false;
-        var text = response["text"]?.GetValue<string>() ?? string.Empty;
-        return (ok, text);
-    }
 }

@@ -45,11 +45,13 @@ public static class HostProfileValidator
         {
             errors.Add("备用端口必须在 0-65535 之间，0 表示不启用");
         }
-        if (candidate.AgentPort > 0
-            && string.IsNullOrWhiteSpace(candidate.AgentToken)
-            && string.IsNullOrWhiteSpace(candidate.AgentTokenEnvironmentVariable))
+        if (candidate.AgentPort > 0 && string.IsNullOrWhiteSpace(candidate.PrivateKeyPath))
         {
-            errors.Add("启用备用端口时必须填写备用令牌或令牌环境变量");
+            errors.Add("启用备用端口时必须填写上面的私钥路径");
+        }
+        if (candidate.AgentFirst && candidate.AgentPort <= 0)
+        {
+            errors.Add("优先走备用端口时必须填写备用端口");
         }
 
         // 1.2 别名唯一（排除自身）

@@ -129,7 +129,8 @@ remote-fs hosts fingerprint web1
 ```
 remote-fs                          打开图形配置界面（仅 Windows，等同于 gui）
 remote-fs serve                    启动 MCP stdio 服务
-remote-fs listen [--port 43336]   在 Linux 服务器上监听备用端口
+remote-fs listen [--port 43336]              在前台监听备用端口
+remote-fs listen --install-service [--port 43336]  注册成开机自启的系统服务
 remote-fs gui                      打开图形界面（仅 Windows）
 remote-fs hosts list               列出已配置主机
 remote-fs hosts add <别名>         交互式添加主机
@@ -153,7 +154,7 @@ remote-fs gui
 | 标签页 | 内容 |
 | --- | --- |
 | 主机配置 | 主机增删改、从 ssh_config 导入、指纹探测、连接测试、生成 MCP 配置片段 |
-| 日志 | 实时日志，等级过滤、底部跟随、详情查看 |
+| 日志 | 实时日志，等级/关键词/失败过滤、底部跟随、详情复制 |
 | 日志设置 | 日志等级、是否记录出入参、轮转与保留、清空日志 |
 | 配置 | 默认主机、白名单、读写上限、超时、命令策略、软链接、目录缓存、后台任务时限与保留、关闭窗口时驻留托盘、开机启动 |
 
@@ -163,26 +164,28 @@ Linux / macOS 没有图形界面，用上面的 `hosts` 与 `config` 子命令�
 
 ## SSH 不可用时的备用端口
 
-文件读写默认走 SSH。SSH 在连接阶段失败（端口不通、握手超时）时，如果这台主机配置了备用端口，同一次工具调用会自动改走该端口。认证失败和指纹不符不会切换。
+文件读写默认走 SSH。主机把 `agentFirst` 设为 `true` 时，直接走备用端口，不再尝试 SSH。没开这个开关时，SSH 在连接阶段失败后的 10 分钟内也不再尝试 SSH，时间过了会再探一次。认证失败和指纹不符不会切换，也不会记入这 10 分钟。
 
-备用端口跑在 **Linux 服务器本机**，直接改本机文件，不经过 SFTP。目前承接 `remote_read_file`、`remote_write_file`、`remote_edit_file`、`remote_patch`、`remote_ls`、`remote_stat`、`remote_mkdir`、`remote_remove`。命令、上传下载和后台任务仍然只走 SSH。
+备用端口跑在 **Linux 服务器本机**，直接改本机文件，不经过 SFTP。同一条 TCP 连接会连续承接多次调用。目前承接 `remote_read_file`、`remote_write_file`、`remote_edit_file`、`remote_patch`、`remote_ls`、`remote_stat`、`remote_mkdir`、`remote_remove`。命令、上传下载和后台任务仍然只走 SSH。
 
 服务器上：
 
+服务器上注册成系统服务，只需做一次。之后开机、进程退出、替换程序文件都会自己起来，不用再手工执行 listen：
+
 ```bash
-export REMOTE_FS_AGENT_TOKEN='一段足够长的随机串'
-# config/config.json 里写明允许修改的目录，例如 "agentAllowedRoots": ["/var/www"]
-remote-fs listen --port 43336
+remote-fs listen --install-service --port 43336
 ```
 
-Windows 上的主机配置增加：
+服务名是 `remote-fs-agent`。允许目录仍放在程序旁边的 `config/config.json`。验签用运行用户的 `~/.ssh/authorized_keys`。
+
+备用通道沿用主机配置里的 SSH 私钥签名，不再另配一套密钥。服务器用运行用户的 `~/.ssh/authorized_keys` 验签。界面上只保留原来的「私钥路径」。
 
 ```json
 "agentPort": 43336,
-"agentTokenEnvironmentVariable": "REMOTE_FS_AGENT_TOKEN"
+"agentFirst": true
 ```
 
-两边的令牌必须一致。端口没有 TLS，令牌会在连接里传输，只对需要访问的来源 IP 放开 43336。`agentAllowedRoots` 为空时拒绝监听。写成 `["/"]` 表示允许本机全部路径。
+`privateKeyPath` 仍指向原来的 SSH 私钥。文件内容仍然是明文，这条通道没有 TLS。
 
 ## 日志
 
@@ -198,7 +201,7 @@ Windows 上的主机配置增加：
 
 `logTraceToolTiming` 默认关闭。打开后，每次工具调用在原有日志之外再写一条 `tool_timing`，只保留工具名、主机、耗时和成败，方便对照文件编辑慢在哪一次调用。这条日志同样受 `logLevel` 过滤。
 
-日志视图向上翻时停止跟随，工具栏显示新增条数，滚回底部后恢复。日志设置保存在 `config/config.json`，改动后需要重启 MCP 服务端才会作用于 `serve` 进程。
+日志视图里，工具调用的摘要优先显示路径、命令、搜索词，而不是整段 JSON。失败和警告用颜色标出来。详情会把 JSON 格式化，错误放在出入参前面。向上翻时停止跟随，工具栏显示新增条数，滚回底部后恢复。可用 Ctrl+F 搜索。日志设置保存在 `config/config.json`，改动后需要重启 MCP 服务端才会作用于 `serve` 进程。
 
 ## 配置
 
@@ -221,7 +224,7 @@ Windows 上的主机配置增加：
     "allowedRoots": ["/etc/nginx", "/var/www"],
     "commandTimeoutMilliseconds": 60000,
     "agentPort": 43336,
-    "agentTokenEnvironmentVariable": "REMOTE_FS_AGENT_TOKEN",
+    "agentFirst": false,
     "description": "生产环境 web 服务器"
   }
 ]
@@ -238,9 +241,9 @@ Windows 上的主机配置增加：
 | `knownHostKeyFingerprint` | 期望的 SHA256 指纹，带 `SHA256:` 前缀 |
 | `allowedRoots` | 允许访问的路径根。空数组表示不限制，访问时会在日志里告警 |
 | `commandTimeoutMilliseconds` | 前台命令的等待时间，默认 60 秒。超时后终止进程组并返回已有输出 |
-| `agentPort` | SSH 连不上时改用的备用端口。0 或不写表示不启用。服务器需先执行 `remote-fs listen` |
-| `agentToken` | 备用端口令牌。会明文进配置文件 |
-| `agentTokenEnvironmentVariable` | 从该环境变量读备用端口令牌，优先于 `agentToken` |
+| `agentPort` | SSH 连不上时改用的备用端口。0 或不写表示不启用 |
+| `privateKeyPath` | SSH 私钥。备用通道也用它签名 |
+| `agentFirst` | 为 `true` 时文件操作不尝试 SSH，直接走备用端口 |
 
 `strictHostKeyChecking` 为 `true` 且没有 `knownHostKeyFingerprint` 时，连接会被拒绝。先执行 `remote-fs hosts fingerprint <别名>` 写入指纹，或把该主机的强校验关掉。
 
@@ -291,7 +294,7 @@ Windows 上的主机配置增加：
 | `jobRetentionDays` / `jobMaxCount` | 远端已结束任务的保留天数，以及每台主机最多保留多少条 |
 | `stayInBackgroundOnExit` | 仅 Windows 图形界面：关闭主窗口时收进托盘 |
 | `agentListenPort` | 服务器上 `remote-fs listen` 未指定 `--port` 时使用的端口。0 表示用默认 43336 |
-| `agentListenToken` | 备用通道令牌。环境变量 `REMOTE_FS_AGENT_TOKEN` 优先 |
+| `agentAuthorizedKeysPath` | 验签用的公钥文件。空则使用运行用户的 `~/.ssh/authorized_keys` |
 | `agentAllowedRoots` | 备用通道允许修改的本机目录。为空时拒绝监听 |
 | `logLevel` | `Debug` / `Info` / `Warn` / `Error` |
 | `logRecordPayloads` | 是否记录工具调用的完整出入参 |

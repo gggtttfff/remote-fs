@@ -1,4 +1,3 @@
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json.Nodes;
 using RemoteFs.Common;
@@ -12,20 +11,8 @@ namespace RemoteFs.Agent;
 /// <summary>
 /// 在服务器本机执行文件工具。SSH 不可用时，Windows 端把同一次工具调用转发到这里。
 /// </summary>
-internal sealed class AgentToolExecutor
+internal sealed partial class AgentToolExecutor
 {
-    private static readonly string[] SupportedTools =
-    [
-        "remote_read_file",
-        "remote_write_file",
-        "remote_edit_file",
-        "remote_patch",
-        "remote_ls",
-        "remote_stat",
-        "remote_mkdir",
-        "remote_remove"
-    ];
-
     private readonly AppConfig _config;
     private readonly PathGuard _guard;
     private readonly HostProfile _localHost;
@@ -48,6 +35,11 @@ internal sealed class AgentToolExecutor
         try
         {
             var context = new ToolCallContext(arguments);
+            if (tool == "remote_exec")
+            {
+                return ExecuteCommand(context);
+            }
+
             var text = tool switch
             {
                 "remote_read_file" => ReadFile(context),
@@ -58,8 +50,16 @@ internal sealed class AgentToolExecutor
                 "remote_stat" => Stat(context),
                 "remote_mkdir" => MakeDirectory(context),
                 "remote_remove" => Remove(context),
-                _ => throw new InvalidOperationException(
-                    "备用通道目前只承接文件读写：" + string.Join("、", SupportedTools) + "。")
+                "remote_move" => Move(context),
+                "remote_copy" => Copy(context),
+                "remote_chmod" => Chmod(context),
+                "remote_symlink" => Symlink(context),
+                "remote_search" => Search(context),
+                "remote_tree" => Tree(context),
+                "remote_job_status" => JobStatus(context),
+                "remote_job_list" => JobList(context),
+                "remote_job_kill" => JobKill(context),
+                _ => throw new InvalidOperationException($"备用通道不支持工具 {tool}")
             };
             return (true, text);
         }
@@ -625,12 +625,5 @@ internal sealed class AgentToolExecutor
         }
 
         return text[..index] + newText + text[(index + oldText.Length)..];
-    }
-
-    public static bool TokenMatches(string expected, string provided)
-    {
-        var left = SHA256.HashData(Encoding.UTF8.GetBytes(expected));
-        var right = SHA256.HashData(Encoding.UTF8.GetBytes(provided));
-        return CryptographicOperations.FixedTimeEquals(left, right);
     }
 }

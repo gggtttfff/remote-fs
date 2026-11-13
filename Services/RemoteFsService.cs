@@ -208,15 +208,7 @@ public sealed class RemoteFsService : IDisposable
     /// </summary>
     public SftpLease OpenSftp(HostProfile profile)
     {
-        try
-        {
-            return _sftpPool.Acquire(profile);
-        }
-        catch (Exception exception) when (exception is not Agent.SshUnavailableException
-                                         && Agent.SshUnavailableException.IsTransportDown(exception))
-        {
-            throw new Agent.SshUnavailableException(profile, exception);
-        }
+        return _sftpPool.AcquireWithFallback(profile);
     }
 
     /// <summary>
@@ -225,14 +217,18 @@ public sealed class RemoteFsService : IDisposable
     /// </summary>
     public SshClient OpenSsh(HostProfile profile, out string fingerprint)
     {
+        Agent.SshRouteCache.ThrowIfSkipped(profile);
         try
         {
-            return _connectionFactory.CreateSshClient(profile, out fingerprint);
+            var client = _connectionFactory.CreateSshClient(profile, out fingerprint);
+            Agent.SshRouteCache.MarkAvailable(profile.Name);
+            return client;
         }
         catch (Exception exception) when (exception is not Agent.SshUnavailableException
                                          && Agent.SshUnavailableException.IsTransportDown(exception))
         {
             fingerprint = string.Empty;
+            Agent.SshRouteCache.MarkDown(profile);
             throw new Agent.SshUnavailableException(profile, exception);
         }
     }

@@ -8,50 +8,28 @@ namespace RemoteFs.Agent;
 /// </summary>
 internal static class AgentFileOwnership
 {
-    public readonly record struct Snapshot(UnixFileMode? Mode, string? Owner);
+    public readonly record struct Snapshot(string? OctalMode, string? Owner);
 
     public static Snapshot Capture(string path)
     {
-        if (!File.Exists(path) && !Directory.Exists(path))
+        if (OperatingSystem.IsWindows() || (!File.Exists(path) && !Directory.Exists(path)))
         {
             return default;
         }
 
-        if (OperatingSystem.IsWindows())
-        {
-            return default;
-        }
-
-        UnixFileMode? mode = null;
-        try
-        {
-            mode = File.GetUnixFileMode(path);
-        }
-        catch (Exception)
-        {
-            // 取不到权限不阻断写入
-        }
-
-        return new Snapshot(mode, QueryOwner(path));
+        return new Snapshot(Query("stat", "-c", "%a", "--", path), Query("stat", "-c", "%u:%g", "--", path));
     }
 
     public static void Restore(string path, Snapshot snapshot)
     {
-        if (snapshot.Mode is { } mode && !OperatingSystem.IsWindows())
-        {
-            try
-            {
-                File.SetUnixFileMode(path, mode);
-            }
-            catch (Exception exception)
-            {
-                AuditLogger.Warn($"备用通道恢复权限失败 {path}: {exception.Message}");
-            }
-        }
-
         if (!string.IsNullOrEmpty(snapshot.Owner))
         {
-            TryChown(path, snapshot.Owner);
+            Run("chown", snapshot.Owner, "--", path);
+        }
+
+        if (!string.IsNullOrEmpty(snapshot.OctalMode))
+        {
+            Run("chmod", snapshot.OctalMode, "--", path);
         }
     }
 
@@ -62,28 +40,24 @@ internal static class AgentFileOwnership
             return;
         }
 
-        File.SetUnixFileMode(path, (UnixFileMode)mode);
+        Run("chmod", Convert.ToString(mode, 8), "--", path);
     }
 
-    private static string? QueryOwner(string path)
+    private static string? Query(string fileName, params string[] arguments)
     {
-        if (!OperatingSystem.IsLinux())
-        {
-            return null;
-        }
-
         try
         {
             var start = new ProcessStartInfo
             {
-                FileName = "stat",
+                FileName = fileName,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false
             };
-            start.ArgumentList.Add("-c");
-            start.ArgumentList.Add("%u:%g");
-            start.ArgumentList.Add(path);
+            foreach (var argument in arguments)
+            {
+                start.ArgumentList.Add(argument);
+            }
 
             using var process = Process.Start(start);
             if (process is null)
@@ -99,9 +73,9 @@ internal static class AgentFileOwnership
                 return null;
             }
 
-            var output = outputTask.GetAwaiter().GetResult().Trim();
             _ = errorTask.GetAwaiter().GetResult();
-            return process.ExitCode != 0 || output.Length == 0 ? null : output;
+            var output = outputTask.GetAwaiter().GetResult().Trim();
+            return process.ExitCode == 0 && output.Length > 0 ? output : null;
         }
         catch (Exception)
         {
@@ -109,19 +83,21 @@ internal static class AgentFileOwnership
         }
     }
 
-    private static void TryChown(string path, string owner)
+    private static void Run(string fileName, params string[] arguments)
     {
         try
         {
             var start = new ProcessStartInfo
             {
-                FileName = "chown",
+                FileName = fileName,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false
             };
-            start.ArgumentList.Add(owner);
-            start.ArgumentList.Add(path);
+            foreach (var argument in arguments)
+            {
+                start.ArgumentList.Add(argument);
+            }
 
             using var process = Process.Start(start);
             if (process is null)
@@ -140,13 +116,12 @@ internal static class AgentFileOwnership
             _ = outputTask.GetAwaiter().GetResult();
             if (process.ExitCode != 0)
             {
-                var error = errorTask.GetAwaiter().GetResult().Trim();
-                AuditLogger.Warn($"备用通道恢复属主失败 {path}: {error}");
+                AuditLogger.Warn($"备用通道 {fileName} 失败 {arguments[^1]}: {errorTask.GetAwaiter().GetResult().Trim()}");
             }
         }
         catch (Exception exception)
         {
-            AuditLogger.Warn($"备用通道恢复属主失败 {path}: {exception.Message}");
+            AuditLogger.Warn($"备用通道 {fileName} 失败: {exception.Message}");
         }
     }
 }

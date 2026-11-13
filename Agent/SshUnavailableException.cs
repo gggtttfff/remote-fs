@@ -14,8 +14,18 @@ public sealed class SshUnavailableException : Exception
         Profile = profile;
     }
 
+    public SshUnavailableException(HostProfile profile, string message, bool alreadyKnown)
+        : base(message)
+    {
+        Profile = profile;
+        AlreadyKnown = alreadyKnown;
+    }
+
     /// <summary>这次没连上的主机</summary>
     public HostProfile Profile { get; }
+
+    /// <summary>已经知道该走备用端口，不需要再把这次切换记成新的故障。</summary>
+    public bool AlreadyKnown { get; }
 
     /// <summary>
     /// 是否属于「端口或握手不可用」。认证被拒、私钥打不开、指纹不符都不算。

@@ -108,8 +108,8 @@ public sealed class AppConfig
     /// <summary>备用通道监听端口。0 表示不在配置里指定，listen 命令默认 43336。</summary>
     public int AgentListenPort { get; set; }
 
-    /// <summary>备用通道令牌。环境变量 REMOTE_FS_AGENT_TOKEN 优先于该字段。</summary>
-    public string? AgentListenToken { get; set; }
+    /// <summary>验签用的公钥文件。空则使用运行用户的 ~/.ssh/authorized_keys。</summary>
+    public string? AgentAuthorizedKeysPath { get; set; }
 
     /// <summary>备用通道允许修改的本机目录。为空时拒绝启动监听。</summary>
     public List<string> AgentAllowedRoots

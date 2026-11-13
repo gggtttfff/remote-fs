@@ -26,7 +26,7 @@ public sealed class HostEditorForm : Form
     // 右侧编辑区
     private readonly TextBox _nameBox = new();
     private readonly TextBox _hostBox = new();
-    private readonly NumericUpDown _portBox = new();
+    private readonly NumericUpDown _portBox = new NoWheelNumericUpDown();
     private readonly TextBox _usernameBox = new();
     private readonly RadioButton _authAuto = new() { Text = "自动", AutoSize = true };
     private readonly RadioButton _authKey = new() { Text = "密钥", AutoSize = true };
@@ -39,10 +39,13 @@ public sealed class HostEditorForm : Form
     private readonly TextBox _fingerprintBox = new();
     private readonly CheckBox _strictHostKeyCheck = new() { Text = "强制校验（指纹不一致时拒绝连接）", AutoSize = true };
     private readonly TextBox _allowedRootsBox = new();
-    private readonly NumericUpDown _commandTimeoutBox = new();
-    private readonly NumericUpDown _agentPortBox = new() { Minimum = 0, Maximum = 65535 };
-    private readonly TextBox _agentTokenBox = new() { UseSystemPasswordChar = true };
-    private readonly TextBox _agentTokenEnvironmentVariableBox = new();
+    private readonly NumericUpDown _commandTimeoutBox = new NoWheelNumericUpDown();
+    private readonly NumericUpDown _agentPortBox = new NoWheelNumericUpDown { Minimum = 0, Maximum = 65535 };
+    private readonly CheckBox _agentFirstCheckBox = new()
+    {
+        Text = "优先走备用端口，不尝试 SSH",
+        AutoSize = true
+    };
     private readonly ComboBox _encodingCombo = new();
     private readonly TextBox _descriptionBox = new();
     private readonly Label _banner = new();
@@ -344,8 +347,7 @@ public sealed class HostEditorForm : Form
         AddEditorRow(table, "允许根目录", _allowedRootsBox);
         AddEditorRow(table, "命令超时(ms)", _commandTimeoutBox);
         AddEditorRow(table, "备用端口", _agentPortBox);
-        AddEditorRow(table, "备用令牌", _agentTokenBox);
-        AddEditorRow(table, "令牌环境变量", _agentTokenEnvironmentVariableBox);
+        AddEditorRow(table, string.Empty, _agentFirstCheckBox);
         AddEditorRow(table, "默认编码", _encodingCombo);
         AddEditorRow(table, "备注", _descriptionBox);
 
@@ -526,8 +528,7 @@ public sealed class HostEditorForm : Form
         yield return _allowedRootsBox;
         yield return _commandTimeoutBox;
         yield return _agentPortBox;
-        yield return _agentTokenBox;
-        yield return _agentTokenEnvironmentVariableBox;
+        yield return _agentFirstCheckBox;
         yield return _encodingCombo;
         yield return _descriptionBox;
     }
@@ -601,8 +602,7 @@ public sealed class HostEditorForm : Form
         _allowedRootsBox.Text = string.Join(", ", profile.AllowedRoots);
         _commandTimeoutBox.Value = Math.Clamp(profile.CommandTimeoutMilliseconds, 1_000, 600_000);
         _agentPortBox.Value = Math.Clamp(profile.AgentPort, 0, 65535);
-        _agentTokenBox.Text = profile.AgentToken ?? string.Empty;
-        _agentTokenEnvironmentVariableBox.Text = profile.AgentTokenEnvironmentVariable ?? string.Empty;
+        _agentFirstCheckBox.Checked = profile.AgentFirst;
         _descriptionBox.Text = profile.Description ?? string.Empty;
 
         RefreshEncodingItems(profile.DefaultEncoding);
@@ -681,8 +681,7 @@ public sealed class HostEditorForm : Form
             AllowedRoots = ParseAllowedRoots(_allowedRootsBox.Text),
             CommandTimeoutMilliseconds = (int)_commandTimeoutBox.Value,
             AgentPort = (int)_agentPortBox.Value,
-            AgentToken = NullIfBlank(_agentTokenBox.Text),
-            AgentTokenEnvironmentVariable = NullIfBlank(_agentTokenEnvironmentVariableBox.Text),
+            AgentFirst = _agentFirstCheckBox.Checked,
             DefaultEncoding = ResolveEncodingValue(),
             Description = NullIfBlank(_descriptionBox.Text)
         };
@@ -707,8 +706,7 @@ public sealed class HostEditorForm : Form
         _allowedRootsBox.Text = string.Empty;
         _commandTimeoutBox.Value = 60_000;
         _agentPortBox.Value = 0;
-        _agentTokenBox.Text = string.Empty;
-        _agentTokenEnvironmentVariableBox.Text = string.Empty;
+        _agentFirstCheckBox.Checked = false;
         RefreshEncodingItems(null);
         _encodingCombo.SelectedItem = FollowGlobalEncodingText;
         _descriptionBox.Text = string.Empty;

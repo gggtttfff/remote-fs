@@ -13,11 +13,14 @@ public static class AgentListener
 {
     public static async Task<int> RunAsync(AppConfig config, int port, CancellationToken cancellationToken)
     {
-        var token = ResolveListenToken(config);
-        if (string.IsNullOrEmpty(token))
+        IReadOnlyList<Renci.SshNet.Security.Key> authorizedKeys;
+        try
         {
-            Console.Error.WriteLine(
-                "拒绝监听：没有备用通道令牌。请设置环境变量 REMOTE_FS_AGENT_TOKEN，或在 config.json 写入 agentListenToken。");
+            authorizedKeys = AgentSshIdentity.LoadAuthorizedKeys(config.AgentAuthorizedKeysPath);
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"拒绝监听：{exception.Message}");
             return 1;
         }
 
@@ -56,7 +59,7 @@ public static class AgentListener
                 }
 
                 // 每条连接独立处理，一台客户端卡住不影响下一次调用
-                _ = Task.Run(() => HandleClient(client, token, executor, cancellationToken));
+                _ = Task.Run(() => HandleClient(client, authorizedKeys, executor, cancellationToken));
             }
         }
         finally
@@ -82,19 +85,11 @@ public static class AgentListener
         return config.AgentListenPort > 0 ? config.AgentListenPort : 43336;
     }
 
-    private static string? ResolveListenToken(AppConfig config)
-    {
-        var fromEnvironment = Environment.GetEnvironmentVariable("REMOTE_FS_AGENT_TOKEN");
-        if (!string.IsNullOrEmpty(fromEnvironment))
-        {
-            return fromEnvironment;
-        }
-
-        return string.IsNullOrEmpty(config.AgentListenToken) ? null : config.AgentListenToken;
-    }
-
     private static void HandleClient(
-        TcpClient client, string expectedToken, AgentToolExecutor executor, CancellationToken cancellationToken)
+        TcpClient client,
+        IReadOnlyList<Renci.SshNet.Security.Key> authorizedKeys,
+        AgentToolExecutor executor,
+        CancellationToken cancellationToken)
     {
         using (client)
         {
@@ -102,52 +97,61 @@ public static class AgentListener
             {
                 client.NoDelay = true;
                 using var stream = client.GetStream();
-                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                timeout.CancelAfter(TimeSpan.FromMinutes(2));
-
-                var requestJson = AgentFrame.ReadAsync(stream, timeout.Token).GetAwaiter().GetResult();
-                if (string.IsNullOrWhiteSpace(requestJson))
+                using var idle = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                idle.CancelAfter(TimeSpan.FromMinutes(2));
+                if (!AgentHandshake.AuthenticateAsServer(stream, authorizedKeys, idle.Token))
                 {
+                    AuditLogger.Warn("备用通道公钥认证失败");
                     return;
                 }
 
-                var request = JsonNode.Parse(requestJson) as JsonObject;
-                var provided = request?["token"]?.GetValue<string>() ?? string.Empty;
-                if (request is null || !AgentToolExecutor.TokenMatches(expectedToken, provided))
+                while (!cancellationToken.IsCancellationRequested)
                 {
-                    WriteResponse(stream, false, "令牌不正确", timeout.Token);
-                    AuditLogger.Warn("备用通道拒绝了一次令牌不匹配的连接");
-                    return;
-                }
+                    using var requestIdle = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    requestIdle.CancelAfter(TimeSpan.FromMinutes(10));
+                    string? requestJson;
+                    try
+                    {
+                        requestJson = AgentFrame.ReadAsync(stream, requestIdle.Token).GetAwaiter().GetResult();
+                    }
+                    catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                    {
+                        AuditLogger.Info("备用通道空闲，关闭这条连接");
+                        return;
+                    }
 
-                var tool = request["tool"]?.GetValue<string>() ?? string.Empty;
-                var arguments = request["arguments"] as JsonObject ?? new JsonObject();
-                string? path = null;
-                try
-                {
-                    path = arguments["path"]?.GetValue<string>();
-                }
-                catch (Exception)
-                {
-                    path = null;
-                }
-                AuditLogger.Info($"备用通道 {tool} {path}");
+                    if (string.IsNullOrWhiteSpace(requestJson))
+                    {
+                        return;
+                    }
 
-                var (ok, text) = executor.Execute(tool, arguments);
-                WriteResponse(stream, ok, text, timeout.Token);
+                    var request = JsonNode.Parse(requestJson) as JsonObject;
+                    if (request is null)
+                    {
+                        WriteResponse(stream, false, "请求不是 JSON 对象", requestIdle.Token);
+                        return;
+                    }
+
+                    var tool = request["tool"]?.GetValue<string>() ?? string.Empty;
+                    var arguments = request["arguments"] as JsonObject ?? new JsonObject();
+                    string? path = null;
+                    try
+                    {
+                        path = arguments["path"]?.GetValue<string>();
+                    }
+                    catch (Exception)
+                    {
+                        path = null;
+                    }
+
+                    AuditLogger.Info($"备用通道 {tool} {path}");
+                    var (ok, text) = executor.Execute(tool, arguments);
+                    WriteResponse(stream, ok, text, requestIdle.Token);
+                }
             }
             catch (Exception exception)
             {
                 AuditLogger.Warn($"备用通道处理连接失败: {exception.Message}");
-                try
-                {
-                    using var stream = client.GetStream();
-                    WriteResponse(stream, false, exception.Message, CancellationToken.None);
-                }
-                catch (Exception)
-                {
-                    // 连接已经断了，没有地方可写
-                }
             }
         }
     }

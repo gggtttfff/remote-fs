@@ -52,6 +52,28 @@ public sealed class SftpConnectionPool : IDisposable
     }
 
     /// <summary>
+    /// 取出一条可用连接，并把连接阶段失败转换成 <see cref="Agent.SshUnavailableException"/>。
+    /// 连接池是备用通道唯一的判断依据，所有取连接的入口都要走这里，
+    /// 否则任务类工具在 SSH 不可用时不会切换到备用端口。
+    /// </summary>
+    public SftpLease AcquireWithFallback(HostProfile profile)
+    {
+        Agent.SshRouteCache.ThrowIfSkipped(profile);
+        try
+        {
+            var lease = Acquire(profile);
+            Agent.SshRouteCache.MarkAvailable(profile.Name);
+            return lease;
+        }
+        catch (Exception exception) when (exception is not Agent.SshUnavailableException
+                                         && Agent.SshUnavailableException.IsTransportDown(exception))
+        {
+            Agent.SshRouteCache.MarkDown(profile);
+            throw new Agent.SshUnavailableException(profile, exception);
+        }
+    }
+
+    /// <summary>
     /// 归还连接
     /// </summary>
     internal void Release(string hostName)

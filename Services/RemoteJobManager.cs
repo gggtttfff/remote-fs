@@ -44,7 +44,7 @@ public sealed class RemoteJobManager : IDisposable
     public RemoteJobHandle StartJob(
         HostProfile profile, string command, int ttlSeconds, string outputEncoding)
     {
-        using var lease = _pool.Acquire(profile);
+        using var lease = _pool.AcquireWithFallback(profile);
         var sftp = lease.Client;
         var environment = ResolveEnvironment(profile, sftp);
 
@@ -102,7 +102,7 @@ public sealed class RemoteJobManager : IDisposable
 
         var finished = false;
         int? exitCode = null;
-        using (var lease = _pool.Acquire(profile))
+        using (var lease = _pool.AcquireWithFallback(profile))
         {
             var sftp = lease.Client;
             var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMilliseconds);
@@ -138,7 +138,7 @@ public sealed class RemoteJobManager : IDisposable
         string stdout;
         string stderr;
         bool truncated;
-        using (var lease = _pool.Acquire(profile))
+        using (var lease = _pool.AcquireWithFallback(profile))
         {
             var sftp = lease.Client;
             (stdout, var stdoutTruncated) = ReadTextOrEmpty(
@@ -168,7 +168,7 @@ public sealed class RemoteJobManager : IDisposable
     /// </summary>
     public RemoteJobInfo GetStatus(HostProfile profile, RemoteJobHandle handle)
     {
-        using var lease = _pool.Acquire(profile);
+        using var lease = _pool.AcquireWithFallback(profile);
         return BuildStatus(lease.Client, handle.JobId, handle.RemoteDirectory);
     }
 
@@ -179,7 +179,7 @@ public sealed class RemoteJobManager : IDisposable
         HostProfile profile, RemoteJobHandle handle,
         long stdoutOffset, long stderrOffset, int maxBytes, string? encodingOverride = null)
     {
-        using var lease = _pool.Acquire(profile);
+        using var lease = _pool.AcquireWithFallback(profile);
         var sftp = lease.Client;
 
         // 输出编码以任务目录里记录的为准，工具参数可以做单次覆盖
@@ -198,7 +198,7 @@ public sealed class RemoteJobManager : IDisposable
     /// </summary>
     public List<RemoteJobInfo> List(HostProfile profile, int limit, bool includeFinished)
     {
-        using var lease = _pool.Acquire(profile);
+        using var lease = _pool.AcquireWithFallback(profile);
         var sftp = lease.Client;
         var environment = ResolveEnvironment(profile, sftp);
         var jobs = new List<RemoteJobInfo>();
@@ -264,7 +264,7 @@ public sealed class RemoteJobManager : IDisposable
         }
 
         // 1.2 没有记录就按服务器上的目录推断，兼容 MCP 重启后的遗留任务
-        using var lease = _pool.Acquire(profile);
+        using var lease = _pool.AcquireWithFallback(profile);
         var sftp = lease.Client;
         var environment = ResolveEnvironment(profile, sftp);
         var directory = environment.JobRoot + "/" + jobId;
@@ -291,7 +291,7 @@ public sealed class RemoteJobManager : IDisposable
     /// </summary>
     public (bool Success, string Message) Kill(HostProfile profile, RemoteJobHandle handle, bool force)
     {
-        using var lease = _pool.Acquire(profile);
+        using var lease = _pool.AcquireWithFallback(profile);
         var sftp = lease.Client;
         var directory = handle.RemoteDirectory;
 
