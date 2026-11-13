@@ -36,4 +36,32 @@ public static class RemotePathInspector
             return false;
         }
     }
+
+    /// <summary>
+    /// 判断路径上任意一级分量是否为符号链接（含最后一段）。
+    /// 只查最后一段时，白名单是 /data 而 /data/link 指向 /etc 的情况下，
+    /// /data/link/passwd 的每一级字符串都合规，实际却读到了范围外的文件。
+    /// </summary>
+    public static bool HasSymbolicLinkComponent(SftpClient sftp, string remotePath)
+    {
+        var normalized = PathGuard.Normalize(remotePath);
+        if (normalized is "/" or ".")
+        {
+            return false;
+        }
+
+        // 逐级拼回去检查；某一级不存在时 IsSymbolicLink 返回 false，
+        // 后续操作会自己报文件不存在，不需要在这里提前判断
+        var current = string.Empty;
+        foreach (var segment in normalized.Split('/', StringSplitOptions.RemoveEmptyEntries))
+        {
+            current += "/" + segment;
+            if (IsSymbolicLink(sftp, current))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 }

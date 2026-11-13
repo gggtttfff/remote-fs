@@ -149,8 +149,11 @@ public sealed class FileWriteTools
                     if (output.ExitCode == RemoteFilePatcher.ExitLineOutOfRange)
                     {
                         var total = output.StandardOutput.Replace("OUT_OF_RANGE:", string.Empty).Trim();
+                        var range = startLine == endLine
+                            ? $"第 {startLine} 行"
+                            : $"第 {startLine}-{endLine} 行";
                         return ToolResult.Error(
-                            $"文件 {path} 只有 {total} 行，没有第 {startLine} 行。"
+                            $"文件 {path} 只有 {total} 行，没有{range}。"
                             + "请先用 remote_read_file 确认行号。");
                     }
                     if (output.ExitCode != 0)

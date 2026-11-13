@@ -25,11 +25,13 @@ public sealed class ConfigTab : UserControl
     private readonly ComboBox _remoteExecPolicyCombo = new();
     private readonly ComboBox _defaultEncodingCombo = new();
     private readonly CheckBox _followSymbolicLinksCheckBox = new();
+    private readonly TextBox _localRootsBox = new();
     private readonly CheckBox _cacheEnabledCheckBox = new();
     private readonly NumericUpDown _cacheTtlSecondsBox = new NoWheelNumericUpDown();
     private readonly NumericUpDown _backgroundJobTtlBox = new NoWheelNumericUpDown();
     private readonly NumericUpDown _jobRetentionDaysBox = new NoWheelNumericUpDown();
     private readonly NumericUpDown _jobMaxCountBox = new NoWheelNumericUpDown();
+    private readonly CheckBox _killJobsOnExitCheckBox = new();
     private readonly CheckBox _stayInBackgroundCheckBox = new();
     private readonly CheckBox _startWithWindowsCheckBox = new();
     private readonly Label _statusLabel = new();
@@ -100,6 +102,8 @@ public sealed class ConfigTab : UserControl
             "Guard 尽力拦截越界路径；Allow 不检查；Deny 直接禁用 remote_exec");
         AddRow(table, "允许软链接", _followSymbolicLinksCheckBox,
             "开启后软链接可被跟随，可能借此访问白名单外的内容");
+        AddRow(table, "本地允许目录", _localRootsBox,
+            "上传下载能触碰的本机目录，逗号分隔。留空表示不限制，此时可以上传任意本地文件");
 
         // 2. 读取与输出限制
         AddSectionTitle(table, "读取与输出限制");
@@ -147,6 +151,8 @@ public sealed class ConfigTab : UserControl
             "已结束的任务目录超过该天数后自动清理");
         AddRow(table, "每主机任务上限", CreateNumberBox(_jobMaxCountBox, 1, 1_000),
             "每台主机最多保留的已结束任务数，超出后从最旧的开始清理");
+        AddRow(table, "退出时终止任务", _killJobsOnExitCheckBox,
+            "关闭后 MCP 退出时任务留在服务器上继续跑，下次启动可用 remote_job_list 接管");
 
         // 6. 程序行为
         AddSectionTitle(table, "程序行为");
@@ -308,11 +314,13 @@ public sealed class ConfigTab : UserControl
         _connectionIdleSecondsBox.Value = Math.Clamp(config.ConnectionIdleSeconds, 10, 86_400);
         _remoteExecPolicyCombo.SelectedItem = config.RemoteExecPolicy.ToString();
         _followSymbolicLinksCheckBox.Checked = config.FollowSymbolicLinks;
+        _localRootsBox.Text = string.Join(", ", config.LocalRoots);
         _cacheEnabledCheckBox.Checked = config.CacheEnabled;
         _cacheTtlSecondsBox.Value = Math.Clamp(config.CacheTtlSeconds, 1, 3600);
         _backgroundJobTtlBox.Value = Math.Clamp(config.BackgroundJobTtlMinutes, 1, 1_440);
         _jobRetentionDaysBox.Value = Math.Clamp(config.JobRetentionDays, 1, 365);
         _jobMaxCountBox.Value = Math.Clamp(config.JobMaxCount, 1, 1_000);
+        _killJobsOnExitCheckBox.Checked = config.KillJobsOnExit;
         _stayInBackgroundCheckBox.Checked = config.StayInBackgroundOnExit;
 
         // 开机启动以注册表为准，不信任配置文件里的镜像
@@ -333,6 +341,19 @@ public sealed class ConfigTab : UserControl
         return TextEncodingResolver.SupportedNames.Contains(normalized)
             ? normalized
             : TextEncodingResolver.Normalize(null);
+    }
+
+    /// <summary>
+    /// 解析逗号或分号分隔的本地目录列表，去空去重
+    /// </summary>
+    private static List<string> ParseLocalRoots(string text)
+    {
+        return text
+            .Split(new[] { ',', ';', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(item => item.Trim())
+            .Where(item => item.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
     }
 
     /// <summary>
@@ -364,11 +385,13 @@ public sealed class ConfigTab : UserControl
             }
 
             config.FollowSymbolicLinks = _followSymbolicLinksCheckBox.Checked;
+            config.LocalRoots = ParseLocalRoots(_localRootsBox.Text);
             config.CacheEnabled = _cacheEnabledCheckBox.Checked;
             config.CacheTtlSeconds = (int)_cacheTtlSecondsBox.Value;
             config.BackgroundJobTtlMinutes = (int)_backgroundJobTtlBox.Value;
             config.JobRetentionDays = (int)_jobRetentionDaysBox.Value;
             config.JobMaxCount = (int)_jobMaxCountBox.Value;
+            config.KillJobsOnExit = _killJobsOnExitCheckBox.Checked;
             config.StayInBackgroundOnExit = _stayInBackgroundCheckBox.Checked;
 
             _configStore.SaveConfig(config);

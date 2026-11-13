@@ -464,7 +464,8 @@ internal sealed partial class AgentToolExecutor
             _guard.EnsureAllowed(_localHost, normalized);
         }
 
-        if (!_config.FollowSymbolicLinks && IsSymlink(normalized))
+        // 逐级检查：中间某一级是软链接时，路径字符串照样落在白名单里，实际却指向范围外
+        if (!_config.FollowSymbolicLinks && HasSymlinkComponent(normalized))
         {
             throw PathGuard.BuildSymbolicLinkRejection(_localHost, normalized);
         }
@@ -548,6 +549,31 @@ internal sealed partial class AgentToolExecutor
         {
             return false;
         }
+    }
+
+    /// <summary>
+    /// 路径本身或任意一级上级目录是否为软链接。
+    /// 只查最后一段时，/data/linked/passwd 这种每一级字符串都合规、
+    /// 实际经 linked 跳到 /etc 的写法能绕过白名单。
+    /// </summary>
+    private static bool HasSymlinkComponent(string normalized)
+    {
+        if (normalized is "/" or ".")
+        {
+            return false;
+        }
+
+        var current = string.Empty;
+        foreach (var segment in normalized.Split('/', StringSplitOptions.RemoveEmptyEntries))
+        {
+            current += "/" + segment;
+            if (IsSymlink(current))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static bool TryParseOctal(string text, out int mode)

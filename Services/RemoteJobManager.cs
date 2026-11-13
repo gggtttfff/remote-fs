@@ -251,6 +251,14 @@ public sealed class RemoteJobManager : IDisposable
             return null;
         }
 
+        // 1.0 任务号来自模型入参，会被拼进远端路径。格式不对直接拒绝，
+        // 否则 ../../ 能穿到任务目录之外，kill 会读到目录外的 pid 文件
+        if (!IsWellFormedJobId(jobId))
+        {
+            AuditLogger.Warn($"拒绝格式非法的任务号: {jobId}");
+            return null;
+        }
+
         // 1.1 本进程提交过的直接命中，省掉一次目录扫描
         lock (_syncRoot)
         {
@@ -284,6 +292,17 @@ public sealed class RemoteJobManager : IDisposable
 
         return new RemoteJobHandle(
             profile.Name, jobId, directory, command, DateTime.UtcNow, outputEncoding);
+    }
+
+    /// <summary>
+    /// 任务号形如 job-20261111-153012-a3f2。只允许字母数字和横线，
+    /// 挡住 ../ 与分隔符被拼进远端路径
+    /// </summary>
+    private static bool IsWellFormedJobId(string jobId)
+    {
+        return jobId.StartsWith("job-", StringComparison.Ordinal)
+            && jobId.Length <= 64
+            && jobId.All(character => char.IsAsciiLetterOrDigit(character) || character == '-');
     }
 
     /// <summary>

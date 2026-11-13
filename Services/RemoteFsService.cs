@@ -188,7 +188,8 @@ public sealed class RemoteFsService : IDisposable
             return;
         }
 
-        if (RemotePathInspector.IsSymbolicLink(sftp, remotePath))
+        // 逐级检查：中间某一级是软链接时，路径字符串照样落在白名单里，实际却指向范围外
+        if (RemotePathInspector.HasSymbolicLinkComponent(sftp, remotePath))
         {
             throw PathGuard.BuildSymbolicLinkRejection(profile, remotePath);
         }
@@ -391,8 +392,13 @@ public sealed class RemoteFsService : IDisposable
 
     public void Dispose()
     {
-        // 先终止任务再关闭连接池：清理阶段还要连远程下发终止信号
-        _jobManager.KillAllStarted();
+        // 先终止任务再关闭连接池：清理阶段还要连远程下发终止信号。
+        // killJobsOnExit 关掉时任务留着继续跑，下次启动按远端目录接管
+        if (_config.KillJobsOnExit)
+        {
+            _jobManager.KillAllStarted();
+        }
+
         _jobManager.Dispose();
         _sftpPool.Dispose();
     }

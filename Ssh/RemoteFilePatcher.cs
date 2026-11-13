@@ -31,6 +31,10 @@ public static class RemoteFilePatcher
         var previousLines = Math.Max(0, startLine - 1);
         var nextLine = endLine + 1;
 
+        // 越界必须以 startLine 和 endLine 中较大的那个为准：
+        // 只查 startLine 时 tail 会输出空，尾部行被 head+payload 静默吃掉
+        var lastRequiredLine = Math.Max(startLine, endLine);
+
         var lines = new[]
         {
             "set -e",
@@ -38,7 +42,7 @@ public static class RemoteFilePatcher
             // 而路径又以 / 开头（绝不是 - 开头），重定向最稳
             // awk 的 NR 能正确处理末行没有换行符的情况，wc -l 会少数一行
             $"TOTAL=$(awk 'END{{print NR}}' < {file})",
-            $"if [ \"$TOTAL\" -lt {startLine} ]; then echo \"OUT_OF_RANGE:$TOTAL\"; exit {ExitLineOutOfRange}; fi",
+            $"if [ \"$TOTAL\" -lt {lastRequiredLine} ]; then echo \"OUT_OF_RANGE:$TOTAL\"; exit {ExitLineOutOfRange}; fi",
             $"head -n {previousLines} < {file} > {temporary}",
             $"cat < {payload} >> {temporary}",
             $"tail -n +{nextLine} < {file} >> {temporary}",

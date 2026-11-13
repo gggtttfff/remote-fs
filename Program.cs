@@ -162,9 +162,15 @@ public static class Program
                     (toolName, toolArguments, exception) =>
                         AgentChannelClient.TryFallback(toolName, toolArguments, exception));
 
-                // 兜底：进程被强制结束时也尽量把远程任务收掉，避免留下孤儿构建
+                // 兜底：进程被强制结束时也尽量把远程任务收掉，避免留下孤儿构建。
+                // killJobsOnExit 关掉时不收，任务留在服务器上供下次启动接管
                 AppDomain.CurrentDomain.ProcessExit += (_, _) =>
                 {
+                    if (!service.Config.KillJobsOnExit)
+                    {
+                        return;
+                    }
+
                     try
                     {
                         service.Jobs.KillAllStarted();

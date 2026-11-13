@@ -84,6 +84,18 @@ public sealed class AppConfig
     /// <summary>是否允许操作符号链接。默认拒绝，防止借道软链接跳出白名单</summary>
     public bool FollowSymbolicLinks { get; set; }
 
+    /// <summary>
+    /// 上传下载允许触碰的本地目录。为空表示不限制。
+    /// 限制的是本机这一侧：防止被提示注入后把 ~/.ssh 之类的文件传上去，或覆盖任意本地文件
+    /// </summary>
+    public List<string> LocalRoots
+    {
+        get => _localRoots;
+        set => _localRoots = value ?? new List<string>();
+    }
+
+    private List<string> _localRoots = new();
+
     /// <summary>是否启用远程目录枚举缓存</summary>
     public bool CacheEnabled { get; set; } = true;
 
@@ -101,6 +113,13 @@ public sealed class AppConfig
 
     /// <summary>每台主机最多保留的已结束任务数，超出后按时间从旧到新清理</summary>
     public int JobMaxCount { get; set; } = 50;
+
+    /// <summary>
+    /// MCP 进程退出时是否终止它启动的远程任务。默认终止。
+    /// 关掉后任务会在服务器上继续跑，下次启动可用 remote_job_list 接管，
+    /// 适合希望构建活过客户端的场景
+    /// </summary>
+    public bool KillJobsOnExit { get; set; } = true;
 
     /// <summary>关闭主窗口时是否驻留后台（托盘），而不是退出进程</summary>
     public bool StayInBackgroundOnExit { get; set; }

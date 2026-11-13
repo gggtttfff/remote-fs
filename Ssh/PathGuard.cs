@@ -9,13 +9,16 @@ namespace RemoteFs.Ssh;
 /// </summary>
 public sealed class PathGuard
 {
-    /// <summary>命令中的绝对路径引用</summary>
+    /// <summary>命令中的绝对路径引用。量词用 * 而非 +，单独的 / 也要能命中</summary>
     private static readonly Regex AbsolutePathPattern =
-        new(@"(?<![\w/.\-])(/[\w./\-*?~$]+)", RegexOptions.Compiled);
+        new(@"(?<![\w/.\-])(/[\w./\-*?~$]*)", RegexOptions.Compiled);
 
-    /// <summary>命令中的相对上级目录跳转，无法确定基准目录，一律拒绝</summary>
+    /// <summary>
+    /// 命令中的相对上级目录跳转，无法确定基准目录，一律拒绝。
+    /// 前置字符包含 /，否则 $HOME/../etc/passwd 这类写法会漏掉
+    /// </summary>
     private static readonly Regex ParentTraversalPattern =
-        new(@"(^|[\s=;|&(""'<>])\.\.(/|\s|$)", RegexOptions.Compiled);
+        new(@"(^|[\s=;|&(""'<>/])\.\.(/|\s|$)", RegexOptions.Compiled);
 
     private readonly AppConfig _config;
 
@@ -110,7 +113,8 @@ public sealed class PathGuard
     public static UnauthorizedAccessException BuildSymbolicLinkRejection(HostProfile profile, string path)
     {
         return new UnauthorizedAccessException(
-            $"路径 {path} 是符号链接。白名单模式下为防止借道软链接访问范围外内容，已拒绝该操作。"
+            $"路径 {path} 本身或其某一级上级目录是符号链接。"
+            + "白名单模式下为防止借道软链接访问范围外内容，已拒绝该操作。"
             + $"请直接使用链接指向的真实路径，或在 {profile.Name} 的配置里开启 followSymbolicLinks。");
     }
 

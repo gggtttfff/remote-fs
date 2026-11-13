@@ -145,8 +145,13 @@ public static class AgentListener
                     }
 
                     AuditLogger.Info($"备用通道 {tool} {path}");
+
+                    // 1.1 回包不能用读请求的令牌：remote_exec 上限 60 分钟，
+                    // 远超这 10 分钟，令牌过期后回包会抛异常，客户端永远等不到响应
                     var (ok, text) = executor.Execute(tool, arguments);
-                    WriteResponse(stream, ok, text, requestIdle.Token);
+                    using var responseWrite = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    responseWrite.CancelAfter(TimeSpan.FromMinutes(2));
+                    WriteResponse(stream, ok, text, responseWrite.Token);
                 }
             }
             catch (Exception exception)

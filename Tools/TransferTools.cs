@@ -76,6 +76,10 @@ public sealed class TransferTools
                 }
 
                 var targetPath = ResolveLocalPath(localPath, remotePath);
+
+                // 1.2 本机侧也要有边界，否则可以被引导着覆盖任意本地文件
+                LocalPathGuard.EnsureAllowed(_service.Config, targetPath);
+
                 if (File.Exists(targetPath) && !overwrite)
                 {
                     return ToolResult.Error(
@@ -143,6 +147,10 @@ public sealed class TransferTools
                 var overwrite = context.GetBool("overwrite");
 
                 var fullLocalPath = Path.GetFullPath(localPath);
+
+                // 1.1 本机侧先校验，避免被引导着把私钥之类的东西传上去
+                LocalPathGuard.EnsureAllowed(_service.Config, fullLocalPath);
+
                 if (!File.Exists(fullLocalPath))
                 {
                     return ToolResult.Error($"本地文件 {fullLocalPath} 不存在");
@@ -238,6 +246,10 @@ public sealed class TransferTools
                 }
 
                 var fullLocalPath = Path.GetFullPath(localPath);
+
+                // 1.2 本机侧先校验，越界路径不落任何文件
+                LocalPathGuard.EnsureAllowed(_service.Config, fullLocalPath);
+
                 Directory.CreateDirectory(fullLocalPath);
 
                 var fileCount = 0;
