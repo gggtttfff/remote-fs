@@ -14,6 +14,22 @@ internal static class AgentConnectionPool
     private static readonly object Gate = new();
     private static readonly Dictionary<string, PooledAgent> Connections = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// 丢弃全部备用连接。主机配置变更后调用，
+    /// 主机地址或端口改过之后，旧连接不能继续用。
+    /// </summary>
+    public static void InvalidateAll()
+    {
+        lock (Gate)
+        {
+            foreach (var pooled in Connections.Values)
+            {
+                pooled.Dispose();
+            }
+            Connections.Clear();
+        }
+    }
+
     public static (bool Ok, string Text) Send(
         HostProfile profile, string toolName, JsonObject arguments)
     {
@@ -26,14 +42,20 @@ internal static class AgentConnectionPool
         var json = request.ToJsonString();
         var timeout = TimeSpan.FromMilliseconds(Math.Max(profile.CommandTimeoutMilliseconds, 30_000));
 
+        PooledAgent pooled;
         lock (Gate)
         {
-            if (!Connections.TryGetValue(key, out var pooled))
+            if (!Connections.TryGetValue(key, out pooled!))
             {
                 pooled = new PooledAgent();
                 Connections[key] = pooled;
             }
+        }
 
+        // 每条连接一把锁：同一主机串行，不同主机互不阻塞。
+        // 锁只包住这条连接自己的收发，不占全局闸门
+        lock (pooled.SyncRoot)
+        {
             try
             {
                 return SendOnce(profile, pooled, json, timeout);
@@ -158,6 +180,9 @@ internal static class AgentConnectionPool
 
     private sealed class PooledAgent : IDisposable
     {
+        /// <summary>这条连接自己的锁。同一主机串行，不同主机互不阻塞</summary>
+        public object SyncRoot { get; } = new();
+
         public TcpClient? Client { get; set; }
 
         public NetworkStream? Stream { get; set; }

@@ -11,6 +11,9 @@ namespace RemoteFs.Ssh;
 /// </summary>
 public sealed class SshConnectionFactory
 {
+    /// <summary>SFTP 单次读写的缓冲区上限。SSH 通道单包最大 64KB，再大没有意义。</summary>
+    private const uint SftpBufferSizeBytes = 64 * 1024;
+
     private readonly AppConfig _config;
 
     public SshConnectionFactory(AppConfig config)
@@ -59,6 +62,11 @@ public sealed class SshConnectionFactory
     {
         var client = new SftpClient(BuildConnectionInfo(profile));
         client.OperationTimeout = TimeSpan.FromMilliseconds(_config.SftpOperationTimeoutMilliseconds);
+
+        // 缓冲区默认 32KB，10 毫秒往返下传输上限约 3.2MB/s。
+        // SSH 通道单包最大 64KB，用满它能接近翻倍
+        client.BufferSize = SftpBufferSizeBytes;
+
         var capture = new HostKeyCapture();
         AttachHostKeyCheck(profile, client, capture);
 

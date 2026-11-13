@@ -15,7 +15,6 @@ namespace RemoteFs.Services;
 /// </summary>
 public sealed class RemoteJobManager : IDisposable
 {
-    private const int PollIntervalMilliseconds = 250;
     private const int StartConfirmationMilliseconds = 5_000;
     private const int LaunchConfirmationMilliseconds = 1_000;
     private const int ShortCommandTimeoutMilliseconds = 30_000;
@@ -23,19 +22,20 @@ public sealed class RemoteJobManager : IDisposable
     private static readonly UTF8Encoding Utf8NoBom = new(false);
 
     private readonly AppConfig _config;
-    private readonly SshConnectionFactory _factory;
     private readonly SftpConnectionPool _pool;
+    private readonly SshConnectionPool _sshPool;
     private readonly Dictionary<string, HostEnvironment> _environments = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTime> _lastCleanupUtc = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<(HostProfile Profile, RemoteJobHandle Handle)> _startedJobs = new();
     private readonly object _syncRoot = new();
     private bool _disposed;
 
-    public RemoteJobManager(AppConfig config, SshConnectionFactory factory, SftpConnectionPool pool)
+    public RemoteJobManager(
+        AppConfig config, SftpConnectionPool pool, SshConnectionPool sshPool)
     {
         _config = config;
-        _factory = factory;
         _pool = pool;
+        _sshPool = sshPool;
     }
 
     /// <summary>
@@ -73,7 +73,7 @@ public sealed class RemoteJobManager : IDisposable
         ExecuteLaunchCommand(profile, launch);
 
         // 1.3 等 pid 文件出现，确认进程真的起来了，避免「提交成功但其实没跑」
-        var processGroupId = WaitForProcessGroupId(sftp, directory);
+        var processGroupId = WaitForProcessGroupId(profile, sftp, directory);
         if (processGroupId is null)
         {
             throw new InvalidOperationException(
@@ -93,6 +93,71 @@ public sealed class RemoteJobManager : IDisposable
     }
 
     /// <summary>
+    /// 在服务器上等任务写出退出码，1 次往返。
+    /// 命令写成 while 循环，文件一出现就立刻返回，不必等轮询粒度。
+    /// </summary>
+    private (bool Finished, int? ExitCode) WaitForExitFile(
+        HostProfile profile, string exitPath, int timeoutMilliseconds)
+    {
+        var command = RemoteJobScripts.BuildWaitForExitCommand(exitPath);
+
+        try
+        {
+            using var lease = _sshPool.Acquire(profile, out _);
+            using var runner = lease.Client.CreateCommand(command);
+            runner.CommandTimeout = TimeSpan.FromMilliseconds(timeoutMilliseconds);
+            runner.Execute();
+
+            var output = runner.Result?.Trim();
+            return (true, int.TryParse(output, out var parsed) ? parsed : (int?)null);
+        }
+        catch (SshOperationTimeoutException)
+        {
+            // 命令还没结束就超时了，任务仍在远端跑
+            return (false, null);
+        }
+        catch (Agent.SshUnavailableException)
+        {
+            // SSH 整个连不上，要让上层改走备用端口，不能在这里吞掉
+            throw;
+        }
+        catch (Exception exception)
+        {
+            // 通道断了之类的情况，退回单次 SFTP 确认，至少能判断出任务到底结束没有
+            AuditLogger.Warn($"等待任务结束失败，改用一次性确认: {exception.Message}");
+            return ReadExitFileOnce(profile, exitPath);
+        }
+    }
+
+    /// <summary>
+    /// 一次性读退出码文件，判断任务是否已经结束
+    /// </summary>
+    private (bool Finished, int? ExitCode) ReadExitFileOnce(HostProfile profile, string exitPath)
+    {
+        try
+        {
+            using var lease = _pool.AcquireWithFallback(profile);
+            var raw = TryReadText(lease.Client, exitPath)?.Trim();
+            if (string.IsNullOrEmpty(raw))
+            {
+                return (false, null);
+            }
+
+            return (true, int.TryParse(raw, out var parsed) ? parsed : (int?)null);
+        }
+        catch (Agent.SshUnavailableException)
+        {
+            // SSH 整个连不上，要让上层改走备用端口，不能在这里吞掉
+            throw;
+        }
+        catch (Exception exception)
+        {
+            AuditLogger.Warn($"读取退出码失败: {exception.Message}");
+            return (false, null);
+        }
+    }
+
+    /// <summary>
     /// 前台等待：返回退出码与全部输出；超时则终止整个进程组，并保留已产生的输出
     /// </summary>
     public ForegroundJobResult WaitForCompletion(
@@ -100,34 +165,10 @@ public sealed class RemoteJobManager : IDisposable
     {
         var exitPath = handle.RemoteDirectory + "/exit";
 
-        var finished = false;
-        int? exitCode = null;
-        using (var lease = _pool.AcquireWithFallback(profile))
-        {
-            var sftp = lease.Client;
-            var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMilliseconds);
-            while (DateTime.UtcNow < deadline)
-            {
-                if (SafeExists(sftp, exitPath))
-                {
-                    finished = true;
-                    break;
-                }
-                Thread.Sleep(PollIntervalMilliseconds);
-            }
-
-            // 到点后再确认一次，避免刚好在最后一刻结束却被判成超时
-            if (!finished)
-            {
-                finished = SafeExists(sftp, exitPath);
-            }
-
-            if (finished)
-            {
-                var rawExit = TryReadText(sftp, exitPath)?.Trim();
-                exitCode = int.TryParse(rawExit, out var parsed) ? parsed : (int?)null;
-            }
-        }
+        // 在服务器上等 exit 文件出现，1 次往返拿结果。
+        // 原来每 250ms 轮询一次 SFTP，60 秒的命令要 240 次往返，
+        // 而且返回时间被轮询粒度拖着走。
+        var (finished, exitCode) = WaitForExitFile(profile, exitPath, timeoutMilliseconds);
 
         if (!finished)
         {
@@ -582,9 +623,41 @@ public sealed class RemoteJobManager : IDisposable
     }
 
     /// <summary>
-    /// 轮询等待 pid 文件，返回进程组 id
+    /// 等 pid 文件出现，返回进程组 id。
+    /// 在服务器上等，1 次往返拿结果；原来每 100ms 轮询一次 SFTP，最多 50 次往返。
     /// </summary>
-    private static int? WaitForProcessGroupId(SftpClient sftp, string directory)
+    private int? WaitForProcessGroupId(HostProfile profile, SftpClient sftp, string directory)
+    {
+        var attempts = Math.Max(1, StartConfirmationMilliseconds / 100);
+        var command = RemoteJobScripts.BuildWaitForPidCommand(directory + "/pid", attempts);
+
+        try
+        {
+            using var lease = _sshPool.Acquire(profile, out _);
+            using var runner = lease.Client.CreateCommand(command);
+            runner.CommandTimeout = TimeSpan.FromMilliseconds(StartConfirmationMilliseconds + 2_000);
+            runner.Execute();
+
+            var output = runner.Result?.Trim();
+            return int.TryParse(output, out var parsed) && parsed > 1 ? parsed : null;
+        }
+        catch (Agent.SshUnavailableException)
+        {
+            // SSH 整个连不上，要让上层改走备用端口，不能在这里吞掉
+            throw;
+        }
+        catch (Exception exception)
+        {
+            // 通道出问题不该让任务提交直接失败，退回轮询再试一次
+            AuditLogger.Warn($"等待任务 pid 失败，改用轮询: {exception.Message}");
+            return WaitForProcessGroupIdByPolling(sftp, directory);
+        }
+    }
+
+    /// <summary>
+    /// 轮询等待 pid 文件，通道不可用时的兜底
+    /// </summary>
+    private static int? WaitForProcessGroupIdByPolling(SftpClient sftp, string directory)
     {
         var deadline = DateTime.UtcNow.AddMilliseconds(StartConfirmationMilliseconds);
         while (DateTime.UtcNow < deadline)
@@ -698,10 +771,15 @@ public sealed class RemoteJobManager : IDisposable
     {
         try
         {
-            using var client = _factory.CreateSshClient(profile, out _);
-            using var runner = client.CreateCommand(command);
+            using var lease = _sshPool.Acquire(profile, out _);
+            using var runner = lease.Client.CreateCommand(command);
             runner.CommandTimeout = TimeSpan.FromMilliseconds(LaunchConfirmationMilliseconds);
             runner.Execute();
+        }
+        catch (Agent.SshUnavailableException)
+        {
+            // SSH 整个连不上，要让上层改走备用端口，不能在这里吞掉
+            throw;
         }
         catch (Exception exception)
         {
@@ -716,8 +794,8 @@ public sealed class RemoteJobManager : IDisposable
     {
         try
         {
-            using var client = _factory.CreateSshClient(profile, out _);
-            using var runner = client.CreateCommand(command);
+            using var lease = _sshPool.Acquire(profile, out _);
+            using var runner = lease.Client.CreateCommand(command);
             runner.CommandTimeout = TimeSpan.FromMilliseconds(timeoutMilliseconds);
             runner.Execute();
 
@@ -726,6 +804,11 @@ public sealed class RemoteJobManager : IDisposable
                 AuditLogger.Warn(
                     $"远程命令退出码 {runner.ExitStatus}: {command}，错误输出 {runner.Error?.Trim()}");
             }
+        }
+        catch (Agent.SshUnavailableException)
+        {
+            // SSH 整个连不上，要让上层改走备用端口，不能在这里吞掉
+            throw;
         }
         catch (Exception exception)
         {
@@ -818,8 +901,8 @@ public sealed class RemoteJobManager : IDisposable
         {
             try
             {
-                using var client = _factory.CreateSshClient(profile, out _);
-                using var runner = client.CreateCommand($"rm -rf -- {ShellQuoting.Quote(directory.FullName)}");
+                using var lease = _sshPool.Acquire(profile, out _);
+                using var runner = lease.Client.CreateCommand($"rm -rf -- {ShellQuoting.Quote(directory.FullName)}");
                 runner.CommandTimeout = TimeSpan.FromMilliseconds(ShortCommandTimeoutMilliseconds);
                 runner.Execute();
                 removed++;

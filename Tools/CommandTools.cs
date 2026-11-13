@@ -301,9 +301,9 @@ public sealed class CommandTools
                         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
                         try
                         {
-                            // 同样放宽指纹校验，只判断网络与认证是否可用
-                            using var client = _service.OpenSsh(
-                                HostKeyValidator.CreateProbeProfile(host), out _);
+                            // 同样放宽指纹校验，只判断网络与认证是否可用。
+                            // 探测连接不进池，避免正式主机借道没校验过的连接
+                            using var client = _service.CreateProbeSsh(host);
                             stopwatch.Stop();
                             builder.AppendLine($"  状态: 可连接（{stopwatch.ElapsedMilliseconds} 毫秒）");
                         }

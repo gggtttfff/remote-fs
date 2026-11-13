@@ -27,25 +27,44 @@ public sealed class SftpConnectionPool : IDisposable
     /// </summary>
     public SftpLease Acquire(HostProfile profile)
     {
+        // 1.1 命中已有连接：锁内只查表，不做握手
         lock (_syncRoot)
         {
             ThrowIfDisposed();
 
-            // 1.1 复用空闲期内且仍然连通的连接
             if (_connections.TryGetValue(profile.Name, out var existing) && existing.IsUsable(_config.ConnectionIdleSeconds))
             {
                 existing.Touch();
                 return new SftpLease(this, profile.Name, existing.Client);
             }
 
-            // 1.2 旧连接不可用则先回收再重建
+            // 旧连接不可用先回收
             if (existing is not null)
             {
                 DisposeEntry(profile.Name, existing);
             }
+        }
 
-            AuditLogger.Info($"建立 SFTP 连接 [{profile.Name}]");
-            var client = _factory.CreateSftpClient(profile);
+        // 1.2 握手在锁外做。握手要几秒，放在锁里会让其它主机全部排队等它
+        AuditLogger.Info($"建立 SFTP 连接 [{profile.Name}]");
+        var client = _factory.CreateSftpClient(profile);
+
+        lock (_syncRoot)
+        {
+            if (_disposed)
+            {
+                client.Dispose();
+                throw new ObjectDisposedException(nameof(SftpConnectionPool));
+            }
+
+            // 1.3 并发时可能已有别的线程建好了同一条连接，多的这份直接丢弃
+            if (_connections.TryGetValue(profile.Name, out var raced) && raced.IsUsable(_config.ConnectionIdleSeconds))
+            {
+                client.Dispose();
+                raced.Touch();
+                return new SftpLease(this, profile.Name, raced.Client);
+            }
+
             _connections[profile.Name] = new PooledConnection(client);
             return new SftpLease(this, profile.Name, client);
         }

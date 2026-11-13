@@ -188,9 +188,13 @@ internal sealed partial class AgentToolExecutor
     {
         var timeout = Math.Clamp(context.GetInt("timeout") ?? 60_000, 1_000, 3_600_000);
         var encodingName = ResolveEncoding(context);
+
+        // 用 bash 而不是 sh：SSH 路径走的是登录用户的 shell，[[ ]] 这类 bash 语法在那边能用，
+        // 备用通道换成 sh 就会出现两条路径行为不一致
+        var shell = File.Exists("/bin/bash") ? "/bin/bash" : "/bin/sh";
         var start = new ProcessStartInfo
         {
-            FileName = "/bin/sh",
+            FileName = shell,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false
@@ -198,7 +202,7 @@ internal sealed partial class AgentToolExecutor
         start.ArgumentList.Add("-c");
         start.ArgumentList.Add(command);
         using var process = Process.Start(start)
-            ?? throw new InvalidOperationException("无法启动 /bin/sh");
+            ?? throw new InvalidOperationException($"无法启动 {shell}");
 
         // 读原始字节再按指定编码解码。直接让 .NET 按默认 UTF-8 读，
         // GBK 输出会变成乱码。

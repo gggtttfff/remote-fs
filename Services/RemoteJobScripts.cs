@@ -89,4 +89,27 @@ public static class RemoteJobScripts
         return $"kill -TERM -- -{processGroupId} 2>/dev/null; sleep 3; "
             + $"kill -KILL -- -{processGroupId} 2>/dev/null; echo killed";
     }
+
+    /// <summary>
+    /// 在服务器上等退出码文件出现，1 次往返拿结果。
+    /// 文件一出现就立刻返回，客户端不必再轮询。
+    /// </summary>
+    public static string BuildWaitForExitCommand(string exitPath)
+    {
+        var exit = ShellQuoting.Quote(exitPath);
+        return $"while [ ! -f {exit} ]; do sleep 0.2; done; cat {exit}";
+    }
+
+    /// <summary>
+    /// 在服务器上等 pid 文件出现，1 次往返拿到进程组号。
+    /// 超时后返回非零退出码，调用方按「没起来」处理。
+    /// </summary>
+    public static string BuildWaitForPidCommand(string pidPath, int attempts)
+    {
+        var pid = ShellQuoting.Quote(pidPath);
+        var count = Math.Max(1, attempts);
+        return $"i=0; while [ $i -lt {count} ]; do "
+            + $"if [ -s {pid} ]; then cat {pid}; exit 0; fi; "
+            + "i=$((i+1)); sleep 0.1; done; exit 1";
+    }
 }

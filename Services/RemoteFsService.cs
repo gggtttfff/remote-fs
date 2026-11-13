@@ -15,6 +15,7 @@ public sealed class RemoteFsService : IDisposable
     private readonly ConfigStore _configStore;
     private readonly SshConnectionFactory _connectionFactory;
     private readonly SftpConnectionPool _sftpPool;
+    private readonly SshConnectionPool _sshPool;
     private readonly PathGuard _pathGuard;
     private readonly Cache.CacheStore _cacheStore;
     private readonly List<HostProfile> _hostCache;
@@ -29,12 +30,13 @@ public sealed class RemoteFsService : IDisposable
         _configStore = configStore;
         _connectionFactory = new SshConnectionFactory(config);
         _sftpPool = new SftpConnectionPool(_connectionFactory, config);
+        _sshPool = new SshConnectionPool(_connectionFactory, config);
         _pathGuard = new PathGuard(config);
         _cacheStore = new Cache.CacheStore(config);
         _cacheStore.Initialize();
         _hostCache = configStore.LoadHosts();
         _hostsFileStamp = ReadHostsFileStamp();
-        _jobManager = new RemoteJobManager(config, _connectionFactory, _sftpPool);
+        _jobManager = new RemoteJobManager(config, _sftpPool, _sshPool);
     }
 
     public AppConfig Config => _config;
@@ -156,8 +158,10 @@ public sealed class RemoteFsService : IDisposable
 
             // 配置变了：被删除的主机不能靠池里的活连接继续用，连接参数改过的也不能沿用旧连接
             var dropped = _sftpPool.InvalidateAll();
+            var droppedSsh = _sshPool.InvalidateAll();
+            Agent.AgentConnectionPool.InvalidateAll();
             AuditLogger.Info(
-                $"主机配置已变更，重新读取到 {reloaded.Count} 台主机，丢弃 {dropped} 条旧连接");
+                $"主机配置已变更，重新读取到 {reloaded.Count} 台主机，丢弃 {dropped} 条 SFTP 连接、{droppedSsh} 条 SSH 连接");
             return true;
         }
         catch (Exception exception)
@@ -213,17 +217,17 @@ public sealed class RemoteFsService : IDisposable
     }
 
     /// <summary>
-    /// 建立 SSH 连接，调用方负责释放。
+    /// 取出一条 SSH 会话，调用方 using 释放即可，底层会话会被连接池复用。
     /// 连接阶段失败时抛出 <see cref="Agent.SshUnavailableException"/>。
     /// </summary>
-    public SshClient OpenSsh(HostProfile profile, out string fingerprint)
+    public SshLease OpenSsh(HostProfile profile, out string fingerprint)
     {
         Agent.SshRouteCache.ThrowIfSkipped(profile);
         try
         {
-            var client = _connectionFactory.CreateSshClient(profile, out fingerprint);
+            var lease = _sshPool.Acquire(profile, out fingerprint);
             Agent.SshRouteCache.MarkAvailable(profile.Name);
-            return client;
+            return lease;
         }
         catch (Exception exception) when (exception is not Agent.SshUnavailableException
                                          && Agent.SshUnavailableException.IsTransportDown(exception))
@@ -235,11 +239,22 @@ public sealed class RemoteFsService : IDisposable
     }
 
     /// <summary>
+    /// 探测用的临时连接，不进连接池。
+    /// 探测副本放宽了指纹校验，放进池里会让正式主机借道一条没校验过的连接。
+    /// </summary>
+    public SshClient CreateProbeSsh(HostProfile profile)
+    {
+        return _connectionFactory.CreateSshClient(
+            HostKeyValidator.CreateProbeProfile(profile), out _);
+    }
+
+    /// <summary>
     /// 执行远程命令并返回输出
     /// </summary>
     public CommandOutput ExecuteCommand(HostProfile profile, string command, int? timeoutMilliseconds)
     {
-        using var client = OpenSsh(profile, out _);
+        using var lease = OpenSsh(profile, out _);
+        var client = lease.Client;
         var timeout = timeoutMilliseconds ?? profile.CommandTimeoutMilliseconds;
 
         using var commandRunner = client.CreateCommand(command);
@@ -252,6 +267,12 @@ public sealed class RemoteFsService : IDisposable
         }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
         {
+            throw new TimeoutException($"命令执行超过 {timeout} 毫秒已中止: {command}");
+        }
+        catch (SshOperationTimeoutException)
+        {
+            // SSH.NET 自己的超时与外部取消令牌几乎同时触发，谁先落地不确定，
+            // 两种异常都要收敛成同一个可读的超时提示
             throw new TimeoutException($"命令执行超过 {timeout} 毫秒已中止: {command}");
         }
 
@@ -401,6 +422,7 @@ public sealed class RemoteFsService : IDisposable
 
         _jobManager.Dispose();
         _sftpPool.Dispose();
+        _sshPool.Dispose();
     }
 }
 
