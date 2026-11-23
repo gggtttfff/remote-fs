@@ -35,7 +35,9 @@ public sealed class LogViewTab : UserControl
     private readonly CheckBox _failuresOnlyBox = new();
     private readonly CheckBox _followCheckBox = new();
     private readonly CheckBox _wrapCheckBox = new();
-    private readonly LinkLabel _newCountLabel = new();
+    // 用普通 Label 而不是 LinkLabel：LinkLabel 在文本为空或链接区域与文本不一致时，
+    // 会拿空区域去 GDI+ 建 Region，直接抛 ArgumentException
+    private readonly Label _newCountLabel = new();
     private readonly Label _statusLabel = new();
     private readonly Label _warningLabel = new();
     private readonly ToolTip _toolTip = new();
@@ -157,10 +159,9 @@ public sealed class LogViewTab : UserControl
         _newCountLabel.AutoSize = true;
         _newCountLabel.Visible = false;
         _newCountLabel.Margin = new Padding(12, 6, 0, 0);
-        _newCountLabel.LinkColor = Color.DarkOrange;
-        _newCountLabel.VisitedLinkColor = Color.DarkOrange;
-        _newCountLabel.ActiveLinkColor = Color.Chocolate;
-        _newCountLabel.LinkBehavior = LinkBehavior.HoverUnderline;
+        _newCountLabel.ForeColor = Color.DarkOrange;
+        _newCountLabel.Font = new Font(_newCountLabel.Font, FontStyle.Underline);
+        _newCountLabel.Cursor = Cursors.Hand;
         bar.Controls.Add(_newCountLabel);
 
         _toolTip.SetToolTip(_levelFilter, "只显示这个级别以及更严重的日志");
@@ -396,7 +397,7 @@ public sealed class LogViewTab : UserControl
             _detailBox.ScrollBars = _wrapCheckBox.Checked ? ScrollBars.Vertical : ScrollBars.Both;
         };
 
-        _newCountLabel.LinkClicked += (_, _) =>
+        _newCountLabel.Click += (_, _) =>
         {
             ScrollToBottom();
             ClearPending();
@@ -1033,7 +1034,6 @@ public sealed class LogViewTab : UserControl
     private void ShowPending()
     {
         _newCountLabel.Text = $"有 {_pendingNewCount} 条新日志，点击跳到底部";
-        _newCountLabel.LinkArea = new LinkArea(0, _newCountLabel.Text.Length);
         _newCountLabel.Visible = true;
     }
 
